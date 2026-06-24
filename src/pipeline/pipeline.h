@@ -49,6 +49,10 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Emit dump-ready facts to a sidecar JSONL file after predump passes and before
+ * SQLite persistence. Intended for the fused Rust runtime transport. */
+void cbm_pipeline_set_facts_output(cbm_pipeline_t *p, const char *path);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 

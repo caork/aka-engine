@@ -927,6 +927,44 @@ TEST(gbuf_flush_skips_orphan_edges) {
     PASS();
 }
 
+TEST(gbuf_snapshot_uses_final_ids_and_skips_orphans) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/repo");
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "proj.a", "a.go", 1, 5, "{}");
+    int64_t deleted =
+        cbm_gbuf_upsert_node(gb, "Function", "deleted", "proj.deleted", "d.go", 1, 5, "{}");
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "proj.b", "b.go", 6, 9,
+                                     "{\"url_path\":\"/b\"}");
+
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", "{}");
+    cbm_gbuf_insert_edge(gb, a, deleted, "CALLS", "{}");
+    cbm_gbuf_insert_edge(gb, a, 9999, "IMPORTS", "{}");
+    cbm_gbuf_delete_by_file(gb, "d.go");
+
+    cbm_gbuf_snapshot_t snapshot = {0};
+    int rc = cbm_gbuf_snapshot_build(gb, &snapshot);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(snapshot.node_count, 2);
+    ASSERT_EQ(snapshot.edge_count, 1);
+
+    ASSERT_EQ(snapshot.nodes[0].id, 1);
+    ASSERT_STR_EQ(snapshot.nodes[0].qualified_name, "proj.a");
+    ASSERT_EQ(snapshot.nodes[1].id, 2);
+    ASSERT_STR_EQ(snapshot.nodes[1].qualified_name, "proj.b");
+    ASSERT_EQ(snapshot.edges[0].id, 1);
+    ASSERT_EQ(snapshot.edges[0].source_id, 1);
+    ASSERT_EQ(snapshot.edges[0].target_id, 2);
+    ASSERT_STR_EQ(snapshot.edges[0].type, "CALLS");
+    ASSERT_STR_EQ(snapshot.edges[0].url_path, "");
+
+    cbm_gbuf_snapshot_free(&snapshot);
+    ASSERT_NULL(snapshot.nodes);
+    ASSERT_NULL(snapshot.edges);
+    ASSERT_EQ(snapshot.node_count, 0);
+    ASSERT_EQ(snapshot.edge_count, 0);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(graph_buffer) {
@@ -983,6 +1021,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_flush_verify_store_data);
     RUN_TEST(gbuf_merge_into_store_preserves);
     RUN_TEST(gbuf_flush_skips_orphan_edges);
+    RUN_TEST(gbuf_snapshot_uses_final_ids_and_skips_orphans);
 
     /* Shared ID tests */
     RUN_TEST(gbuf_shared_ids_unique);

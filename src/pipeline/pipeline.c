@@ -31,6 +31,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include <yyjson/yyjson.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -77,6 +78,7 @@ struct cbm_pipeline {
     cbm_index_mode_t mode;
     atomic_int cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    char *facts_output_path;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -131,6 +133,249 @@ static void log_phase_mem(const char *phase) {
                  itoa_buf((int)(cbm_mem_peak_rss() / PL_BYTES_PER_MB)));
 }
 
+static void write_json_string_content(FILE *fp, const char *s) {
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            switch (*p) {
+            case '"':
+                fputs("\\\"", fp);
+                break;
+            case '\\':
+                fputs("\\\\", fp);
+                break;
+            case '\b':
+                fputs("\\b", fp);
+                break;
+            case '\f':
+                fputs("\\f", fp);
+                break;
+            case '\n':
+                fputs("\\n", fp);
+                break;
+            case '\r':
+                fputs("\\r", fp);
+                break;
+            case '\t':
+                fputs("\\t", fp);
+                break;
+            default:
+                if (*p < 0x20) {
+                    fprintf(fp, "\\u%04x", *p);
+                } else {
+                    fputc(*p, fp);
+                }
+                break;
+            }
+        }
+    }
+}
+
+static void write_json_string(FILE *fp, const char *s) {
+    fputc('"', fp);
+    write_json_string_content(fp, s);
+    fputc('"', fp);
+}
+
+static void write_aka_node_id(FILE *fp, int64_t id, const char *qualified_name) {
+    fprintf(fp, "\"cbm:%lld:", (long long)id);
+    write_json_string_content(fp, qualified_name ? qualified_name : "");
+    fputc('"', fp);
+}
+
+static int fact_line(int line) {
+    return line > 0 ? line - 1 : 0;
+}
+
+static yyjson_mut_val *props_object_copy(yyjson_mut_doc *out_doc, const char *props,
+                                         yyjson_doc **owned_doc) {
+    *owned_doc = NULL;
+    if (props && props[0]) {
+        yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+        if (doc) {
+            yyjson_val *root = yyjson_doc_get_root(doc);
+            if (root && yyjson_is_obj(root)) {
+                yyjson_mut_val *copy = yyjson_val_mut_copy(out_doc, root);
+                if (copy) {
+                    *owned_doc = doc;
+                    return copy;
+                }
+            }
+            yyjson_doc_free(doc);
+        }
+    }
+    return yyjson_mut_obj(out_doc);
+}
+
+static void write_mut_json_value(FILE *fp, yyjson_mut_doc *doc, yyjson_mut_val *value) {
+    yyjson_mut_doc_set_root(doc, value);
+    char *json = yyjson_mut_write(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL);
+    if (json) {
+        fputs(json, fp);
+        free(json);
+    } else {
+        fputs("{}", fp);
+    }
+}
+
+static void emit_node_fact(FILE *fp, const CBMDumpNode *node) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_doc *props_doc = NULL;
+    yyjson_mut_val *props = props_object_copy(doc, node->properties, &props_doc);
+    yyjson_mut_obj_put(props, yyjson_mut_str(doc, "name"),
+                       yyjson_mut_str(doc, node->name ? node->name : ""));
+    yyjson_mut_obj_put(props, yyjson_mut_str(doc, "qualifiedName"),
+                       yyjson_mut_str(doc, node->qualified_name ? node->qualified_name : ""));
+    yyjson_mut_obj_put(props, yyjson_mut_str(doc, "filePath"),
+                       yyjson_mut_str(doc, node->file_path ? node->file_path : ""));
+    yyjson_mut_obj_put(props, yyjson_mut_str(doc, "startLine"),
+                       yyjson_mut_int(doc, fact_line(node->start_line)));
+    yyjson_mut_obj_put(props, yyjson_mut_str(doc, "endLine"),
+                       yyjson_mut_int(doc, fact_line(node->end_line)));
+    yyjson_mut_obj_put(props, yyjson_mut_str(doc, "cbmId"), yyjson_mut_sint(doc, node->id));
+
+    fprintf(fp, "{\"kind\":\"node\",\"id\":");
+    write_aka_node_id(fp, node->id, node->qualified_name);
+    fprintf(fp, ",\"label\":");
+    write_json_string(fp, node->label ? node->label : "");
+    fprintf(fp, ",\"properties\":");
+    write_mut_json_value(fp, doc, props);
+    fprintf(fp, "}\n");
+    if (props_doc) {
+        yyjson_doc_free(props_doc);
+    }
+    yyjson_mut_doc_free(doc);
+}
+
+static void emit_edge_fact(FILE *fp, const CBMDumpEdge *edge, const CBMDumpNode *nodes,
+                           int node_count) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_doc *props_doc = NULL;
+    yyjson_mut_val *props = props_object_copy(doc, edge->properties, &props_doc);
+    yyjson_mut_val *confidence_val = yyjson_mut_obj_get(props, "confidence");
+    yyjson_mut_val *reason_val = yyjson_mut_obj_get(props, "reason");
+    yyjson_mut_val *step_val = yyjson_mut_obj_get(props, "step");
+    double confidence =
+        confidence_val && yyjson_mut_is_num(confidence_val) ? yyjson_mut_get_num(confidence_val)
+                                                           : 1.0;
+    const char *reason =
+        reason_val && yyjson_mut_is_str(reason_val) ? yyjson_mut_get_str(reason_val) : "aka-engine";
+    const char *source_qn =
+        (edge->source_id > 0 && edge->source_id <= node_count)
+            ? (nodes[edge->source_id - SKIP_ONE].qualified_name
+                   ? nodes[edge->source_id - SKIP_ONE].qualified_name
+                   : "")
+            : "";
+    const char *target_qn =
+        (edge->target_id > 0 && edge->target_id <= node_count)
+            ? (nodes[edge->target_id - SKIP_ONE].qualified_name
+                   ? nodes[edge->target_id - SKIP_ONE].qualified_name
+                   : "")
+            : "";
+
+    fprintf(fp, "{\"kind\":\"edge\",\"id\":\"cbm-edge:%lld\",\"sourceId\":",
+            (long long)edge->id);
+    write_aka_node_id(fp, edge->source_id, source_qn);
+    fprintf(fp, ",\"targetId\":");
+    write_aka_node_id(fp, edge->target_id, target_qn);
+    fprintf(fp, ",\"type\":");
+    write_json_string(fp, edge->type ? edge->type : "");
+    fprintf(fp, ",\"confidence\":%.6g,\"reason\":", confidence);
+    write_json_string(fp, reason);
+    if (step_val && yyjson_mut_is_int(step_val)) {
+        fprintf(fp, ",\"step\":%lld", (long long)yyjson_mut_get_sint(step_val));
+    }
+    fprintf(fp, ",\"evidence\":");
+    write_mut_json_value(fp, doc, props);
+    fprintf(fp, "}\n");
+    if (props_doc) {
+        yyjson_doc_free(props_doc);
+    }
+    yyjson_mut_doc_free(doc);
+}
+
+static int emit_facts_sidecar(cbm_pipeline_t *p) {
+    if (!p || !p->facts_output_path || !p->gbuf) {
+        return 0;
+    }
+
+    char tmp_path[CBM_SZ_1K];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", p->facts_output_path);
+
+    char out_dir[CBM_SZ_1K];
+    snprintf(out_dir, sizeof(out_dir), "%s", p->facts_output_path);
+    char *last_slash = strrchr(out_dir, '/');
+#ifdef _WIN32
+    char *last_backslash = strrchr(out_dir, '\\');
+    if (!last_slash || (last_backslash && last_backslash > last_slash)) {
+        last_slash = last_backslash;
+    }
+#endif
+    if (last_slash) {
+        *last_slash = '\0';
+        cbm_mkdir_p(out_dir, CBM_DIR_PERMS);
+    }
+
+    cbm_gbuf_snapshot_t snapshot = {0};
+    int rc = cbm_gbuf_snapshot_build(p->gbuf, &snapshot);
+    if (rc != 0) {
+        cbm_log_error("pipeline.err", "phase", "facts_snapshot");
+        return rc;
+    }
+
+    FILE *fp = fopen(tmp_path, "wb");
+    if (!fp) {
+        cbm_gbuf_snapshot_free(&snapshot);
+        cbm_log_error("pipeline.err", "phase", "facts_sidecar_open");
+        return CBM_NOT_FOUND;
+    }
+
+    int file_count = 0;
+    const char *last_file = NULL;
+    for (int i = 0; i < snapshot.node_count; i++) {
+        if (!snapshot.nodes[i].label || strcmp(snapshot.nodes[i].label, "File") != 0) {
+            continue;
+        }
+        const char *file_path = snapshot.nodes[i].file_path ? snapshot.nodes[i].file_path : "";
+        if (file_path[0] && (!last_file || strcmp(last_file, file_path) != 0)) {
+            file_count++;
+            last_file = file_path;
+        }
+    }
+
+    fprintf(fp,
+            "{\"kind\":\"manifest\",\"contractVersion\":1,\"engineVersion\":\"aka-engine\","
+            "\"repoPath\":");
+    write_json_string(fp, p->repo_path);
+    fprintf(fp, ",\"generatedAt\":\"\",\"stats\":{\"files\":%d,\"nodes\":%d,\"edges\":%d,"
+                "\"chunks\":0}}\n",
+            file_count, snapshot.node_count, snapshot.edge_count);
+    for (int i = 0; i < snapshot.node_count; i++) {
+        emit_node_fact(fp, &snapshot.nodes[i]);
+    }
+    for (int i = 0; i < snapshot.edge_count; i++) {
+        emit_edge_fact(fp, &snapshot.edges[i], snapshot.nodes, snapshot.node_count);
+    }
+    fprintf(fp, "{\"kind\":\"done\",\"stats\":{\"files\":%d,\"nodes\":%d,\"edges\":%d,"
+                "\"chunks\":0}}\n",
+            file_count, snapshot.node_count, snapshot.edge_count);
+
+    int emitted_nodes = snapshot.node_count;
+    int close_rc = fclose(fp);
+    cbm_gbuf_snapshot_free(&snapshot);
+    if (close_rc != 0) {
+        remove(tmp_path);
+        cbm_log_error("pipeline.err", "phase", "facts_sidecar_close");
+        return CBM_NOT_FOUND;
+    }
+    if (rename(tmp_path, p->facts_output_path) != 0) {
+        remove(tmp_path);
+        cbm_log_error("pipeline.err", "phase", "facts_sidecar_rename");
+        return CBM_NOT_FOUND;
+    }
+    cbm_log_info("pass.timing", "pass", "facts_sidecar", "nodes", itoa_buf(emitted_nodes));
+    return 0;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
@@ -160,6 +405,14 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     }
 }
 
+void cbm_pipeline_set_facts_output(cbm_pipeline_t *p, const char *path) {
+    if (!p) {
+        return;
+    }
+    free(p->facts_output_path);
+    p->facts_output_path = (path && path[0]) ? strdup(path) : NULL;
+}
+
 void cbm_pipeline_free(cbm_pipeline_t *p) {
     if (!p) {
         return;
@@ -167,6 +420,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     free(p->repo_path);
     free(p->db_path);
     free(p->project_name);
+    free(p->facts_output_path);
     cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
@@ -930,6 +1184,9 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
 
     if (!check_cancel(p)) {
+        rc = emit_facts_sidecar(p);
+    }
+    if (!check_cancel(p) && rc == 0) {
         struct timespec t;
         CBM_PROF_START(t_dump);
         rc = dump_and_persist_hashes(p, files, file_count, &t);

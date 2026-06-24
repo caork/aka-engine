@@ -11,6 +11,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+
+#include "sqlite_writer.h"
 #include <stdatomic.h>
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
@@ -42,6 +44,18 @@ typedef struct {
     char *type;            /* heap-owned */
     char *properties_json; /* heap-owned JSON string, "{}" default */
 } cbm_gbuf_edge_t;
+
+/* Dump-ready, final-id snapshot of the graph buffer. Unlike the raw gbuf
+ * visitors, these rows use the same live-node filtering and temp-to-final ID
+ * remapping as the SQLite dump path. All strings are borrowed from the graph
+ * buffer or this snapshot and stay valid until cbm_gbuf_snapshot_free(). */
+typedef struct {
+    CBMDumpNode *nodes;
+    int node_count;
+    CBMDumpEdge *edges;
+    int edge_count;
+    char **edge_url_paths;
+} cbm_gbuf_snapshot_t;
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
@@ -117,6 +131,11 @@ void cbm_gbuf_foreach_node(const cbm_gbuf_t *gb, cbm_gbuf_node_visitor_fn fn, vo
 /* Iterate all edges. */
 typedef void (*cbm_gbuf_edge_visitor_fn)(const cbm_gbuf_edge_t *edge, void *userdata);
 void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, void *userdata);
+
+/* Build a dump-ready fact snapshot without writing SQLite. The caller owns the
+ * arrays and must call cbm_gbuf_snapshot_free(). */
+int cbm_gbuf_snapshot_build(cbm_gbuf_t *gb, cbm_gbuf_snapshot_t *out);
+void cbm_gbuf_snapshot_free(cbm_gbuf_snapshot_t *snapshot);
 
 /* ── Edge operations ─────────────────────────────────────────────── */
 

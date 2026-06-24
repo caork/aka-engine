@@ -288,7 +288,9 @@ static const tool_def_t TOOLS[] = {
      "Use [\\\"*\\\"] for all indexed projects. Run list_projects to see available projects.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
-     "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
+     "Teammates can bootstrap from the artifact instead of full re-indexing.\"},"
+     "\"facts_output_path\":{\"type\":\"string\",\"description\":"
+     "\"Internal fused runtime transport: write direct fact JSONL sidecar.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph",
@@ -2589,13 +2591,17 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(mode_str);
 
     bool persistence = cbm_mcp_get_bool_arg(args, "persistence");
+    char *facts_output_path = cbm_mcp_get_string_arg(args, "facts_output_path");
 
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
+        free(facts_output_path);
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
     cbm_pipeline_set_persistence(p, persistence);
+    cbm_pipeline_set_facts_output(p, facts_output_path);
+    free(facts_output_path);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 

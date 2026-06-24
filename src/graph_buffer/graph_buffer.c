@@ -58,6 +58,13 @@ typedef CBM_DYN_ARRAY(const cbm_gbuf_edge_t *) edge_ptr_array_t;
 /* Per-label or per-name node list */
 typedef CBM_DYN_ARRAY(const cbm_gbuf_node_t *) node_ptr_array_t;
 
+static int count_live_nodes(cbm_gbuf_t *gb);
+static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *temp_to_final,
+                                     int64_t max_temp_id, int *out_count,
+                                     cbm_gbuf_node_t ***src_out);
+static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_final,
+                                     int64_t max_temp_id, int *out_count, char ***out_url_paths);
+
 struct cbm_gbuf {
     char *project;
     char *root_path;
@@ -897,6 +904,60 @@ void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, vo
     }
 }
 
+int cbm_gbuf_snapshot_build(cbm_gbuf_t *gb, cbm_gbuf_snapshot_t *out) {
+    if (!gb || !out) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+
+    int live_count = count_live_nodes(gb);
+    int64_t max_temp_id = gb->next_id;
+    int64_t *temp_to_final = calloc((size_t)max_temp_id, sizeof(int64_t));
+    if (!temp_to_final) {
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_gbuf_node_t **src_nodes = NULL;
+    CBMDumpNode *nodes =
+        build_dump_nodes(gb, live_count, temp_to_final, max_temp_id, &out->node_count, &src_nodes);
+    free(src_nodes);
+    if (!nodes) {
+        free(temp_to_final);
+        memset(out, 0, sizeof(*out));
+        return CBM_NOT_FOUND;
+    }
+
+    char **url_paths = NULL;
+    CBMDumpEdge *edges =
+        build_dump_edges(gb, temp_to_final, max_temp_id, &out->edge_count, &url_paths);
+    if (!edges) {
+        free(url_paths);
+        free(nodes);
+        free(temp_to_final);
+        memset(out, 0, sizeof(*out));
+        return CBM_NOT_FOUND;
+    }
+
+    out->nodes = nodes;
+    out->edges = edges;
+    out->edge_url_paths = url_paths;
+    free(temp_to_final);
+    return 0;
+}
+
+void cbm_gbuf_snapshot_free(cbm_gbuf_snapshot_t *snapshot) {
+    if (!snapshot) {
+        return;
+    }
+    for (int i = 0; i < snapshot->edge_count; i++) {
+        free(snapshot->edge_url_paths ? snapshot->edge_url_paths[i] : NULL);
+    }
+    free(snapshot->edge_url_paths);
+    free(snapshot->edges);
+    free(snapshot->nodes);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
 /* ── Edge operations ─────────────────────────────────────────────── */
 
 int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
@@ -1197,7 +1258,7 @@ static char *extract_url_path(const char *props) {
 
 /* Remap a temp edge ID to its final sequential ID, or 0 if out of range. */
 static int64_t remap_id(const int64_t *temp_to_final, int64_t max_temp_id, int64_t temp_id) {
-    return (temp_id < max_temp_id) ? temp_to_final[temp_id] : 0;
+    return (temp_id > 0 && temp_id < max_temp_id) ? temp_to_final[temp_id] : 0;
 }
 
 /* Build dump-ready node array with sequential IDs. Populates temp_to_final mapping. */
@@ -1212,6 +1273,11 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
                                      cbm_gbuf_node_t ***src_out) {
     size_t cap = (size_t)(live_count > 0 ? live_count : SKIP_ONE);
     CBMDumpNode *dump_nodes = malloc(cap * sizeof(CBMDumpNode));
+    if (!dump_nodes) {
+        *out_count = 0;
+        *src_out = NULL;
+        return NULL;
+    }
     /* Parallel gbuf-node pointers so a streamed partition can free its heavy
      * properties_json after the rows are persisted. NULL on OOM disables the
      * per-partition free (the dump still succeeds). */
@@ -1269,6 +1335,13 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
     CBMDumpEdge *dump_edges =
         malloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE) * sizeof(CBMDumpEdge));
     char **url_paths = calloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE), sizeof(char *));
+    if (!dump_edges || !url_paths) {
+        free(dump_edges);
+        free(url_paths);
+        *out_count = 0;
+        *out_url_paths = NULL;
+        return NULL;
+    }
     int idx = 0;
 
     for (int i = 0; i < gb->edges.count; i++) {
