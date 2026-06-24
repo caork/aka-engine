@@ -79,6 +79,7 @@ struct cbm_pipeline {
     atomic_int cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
     char *facts_output_path;
+    const cbm_fact_sink_t *fact_sink;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -206,19 +207,15 @@ static yyjson_mut_val *props_object_copy(yyjson_mut_doc *out_doc, const char *pr
     return yyjson_mut_obj(out_doc);
 }
 
-static void write_mut_json_value(FILE *fp, yyjson_mut_doc *doc, yyjson_mut_val *value) {
-    yyjson_mut_doc_set_root(doc, value);
-    char *json = yyjson_mut_write(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL);
-    if (json) {
-        fputs(json, fp);
-        free(json);
-    } else {
-        fputs("{}", fp);
-    }
-}
-
-static void emit_node_fact(FILE *fp, const CBMDumpNode *node) {
+static int normalized_props_for_node(const CBMDumpNode *node, yyjson_mut_doc **out_doc,
+                                     yyjson_doc **out_props_doc, char **out_json) {
+    *out_doc = NULL;
+    *out_props_doc = NULL;
+    *out_json = NULL;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return CBM_NOT_FOUND;
+    }
     yyjson_doc *props_doc = NULL;
     yyjson_mut_val *props = props_object_copy(doc, node->properties, &props_doc);
     yyjson_mut_obj_put(props, yyjson_mut_str(doc, "name"),
@@ -232,65 +229,236 @@ static void emit_node_fact(FILE *fp, const CBMDumpNode *node) {
     yyjson_mut_obj_put(props, yyjson_mut_str(doc, "endLine"),
                        yyjson_mut_int(doc, fact_line(node->end_line)));
     yyjson_mut_obj_put(props, yyjson_mut_str(doc, "cbmId"), yyjson_mut_sint(doc, node->id));
-
-    fprintf(fp, "{\"kind\":\"node\",\"id\":");
-    write_aka_node_id(fp, node->id, node->qualified_name);
-    fprintf(fp, ",\"label\":");
-    write_json_string(fp, node->label ? node->label : "");
-    fprintf(fp, ",\"properties\":");
-    write_mut_json_value(fp, doc, props);
-    fprintf(fp, "}\n");
-    if (props_doc) {
-        yyjson_doc_free(props_doc);
+    yyjson_mut_doc_set_root(doc, props);
+    char *json = yyjson_mut_write(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL);
+    if (!json) {
+        if (props_doc) {
+            yyjson_doc_free(props_doc);
+        }
+        yyjson_mut_doc_free(doc);
+        return CBM_NOT_FOUND;
     }
-    yyjson_mut_doc_free(doc);
+    *out_doc = doc;
+    *out_props_doc = props_doc;
+    *out_json = json;
+    return 0;
 }
 
-static void emit_edge_fact(FILE *fp, const CBMDumpEdge *edge, const CBMDumpNode *nodes,
-                           int node_count) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_doc *props_doc = NULL;
-    yyjson_mut_val *props = props_object_copy(doc, edge->properties, &props_doc);
-    yyjson_mut_val *confidence_val = yyjson_mut_obj_get(props, "confidence");
-    yyjson_mut_val *reason_val = yyjson_mut_obj_get(props, "reason");
-    yyjson_mut_val *step_val = yyjson_mut_obj_get(props, "step");
-    double confidence =
+typedef struct {
+    yyjson_mut_doc *doc;
+    yyjson_doc *props_doc;
+    yyjson_mut_val *props;
+    yyjson_mut_val *step_val;
+    char *props_json;
+    double confidence;
+    const char *reason;
+} edge_fact_payload_t;
+
+static int edge_fact_payload_init(const CBMDumpEdge *edge, edge_fact_payload_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->doc = yyjson_mut_doc_new(NULL);
+    if (!out->doc) {
+        return CBM_NOT_FOUND;
+    }
+    out->props = props_object_copy(out->doc, edge->properties, &out->props_doc);
+    yyjson_mut_val *confidence_val = yyjson_mut_obj_get(out->props, "confidence");
+    yyjson_mut_val *reason_val = yyjson_mut_obj_get(out->props, "reason");
+    out->step_val = yyjson_mut_obj_get(out->props, "step");
+    out->confidence =
         confidence_val && yyjson_mut_is_num(confidence_val) ? yyjson_mut_get_num(confidence_val)
                                                            : 1.0;
-    const char *reason =
+    out->reason =
         reason_val && yyjson_mut_is_str(reason_val) ? yyjson_mut_get_str(reason_val) : "aka-engine";
-    const char *source_qn =
-        (edge->source_id > 0 && edge->source_id <= node_count)
-            ? (nodes[edge->source_id - SKIP_ONE].qualified_name
-                   ? nodes[edge->source_id - SKIP_ONE].qualified_name
-                   : "")
-            : "";
-    const char *target_qn =
-        (edge->target_id > 0 && edge->target_id <= node_count)
-            ? (nodes[edge->target_id - SKIP_ONE].qualified_name
-                   ? nodes[edge->target_id - SKIP_ONE].qualified_name
-                   : "")
-            : "";
+    yyjson_mut_doc_set_root(out->doc, out->props);
+    out->props_json = yyjson_mut_write(out->doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL);
+    if (!out->props_json) {
+        if (out->props_doc) {
+            yyjson_doc_free(out->props_doc);
+        }
+        yyjson_mut_doc_free(out->doc);
+        memset(out, 0, sizeof(*out));
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
 
-    fprintf(fp, "{\"kind\":\"edge\",\"id\":\"cbm-edge:%lld\",\"sourceId\":",
-            (long long)edge->id);
-    write_aka_node_id(fp, edge->source_id, source_qn);
-    fprintf(fp, ",\"targetId\":");
-    write_aka_node_id(fp, edge->target_id, target_qn);
-    fprintf(fp, ",\"type\":");
-    write_json_string(fp, edge->type ? edge->type : "");
-    fprintf(fp, ",\"confidence\":%.6g,\"reason\":", confidence);
-    write_json_string(fp, reason);
-    if (step_val && yyjson_mut_is_int(step_val)) {
-        fprintf(fp, ",\"step\":%lld", (long long)yyjson_mut_get_sint(step_val));
+static void edge_fact_payload_free(edge_fact_payload_t *payload) {
+    free(payload->props_json);
+    if (payload->props_doc) {
+        yyjson_doc_free(payload->props_doc);
     }
-    fprintf(fp, ",\"evidence\":");
-    write_mut_json_value(fp, doc, props);
-    fprintf(fp, "}\n");
-    if (props_doc) {
-        yyjson_doc_free(props_doc);
+    yyjson_mut_doc_free(payload->doc);
+}
+
+static int emit_facts_to_sink(cbm_pipeline_t *p, const cbm_fact_sink_t *sink) {
+    if (!p || !sink || !p->gbuf) {
+        return 0;
     }
-    yyjson_mut_doc_free(doc);
+
+    cbm_gbuf_snapshot_t snapshot = {0};
+    int rc = cbm_gbuf_snapshot_build(p->gbuf, &snapshot);
+    if (rc != 0) {
+        cbm_log_error("pipeline.err", "phase", "facts_snapshot");
+        return rc;
+    }
+
+    int file_count = 0;
+    const char *last_file = NULL;
+    for (int i = 0; i < snapshot.node_count; i++) {
+        if (!snapshot.nodes[i].label || strcmp(snapshot.nodes[i].label, "File") != 0) {
+            continue;
+        }
+        const char *file_path = snapshot.nodes[i].file_path ? snapshot.nodes[i].file_path : "";
+        if (file_path[0] && (!last_file || strcmp(last_file, file_path) != 0)) {
+            file_count++;
+            last_file = file_path;
+        }
+    }
+
+    if (sink->manifest &&
+        sink->manifest(sink->userdata, p->repo_path, file_count, snapshot.node_count,
+                       snapshot.edge_count) != 0) {
+        cbm_gbuf_snapshot_free(&snapshot);
+        return CBM_NOT_FOUND;
+    }
+
+    for (int i = 0; i < snapshot.node_count; i++) {
+        if (!sink->node) {
+            break;
+        }
+        yyjson_mut_doc *doc = NULL;
+        yyjson_doc *props_doc = NULL;
+        char *props_json = NULL;
+        if (normalized_props_for_node(&snapshot.nodes[i], &doc, &props_doc, &props_json) != 0) {
+            cbm_gbuf_snapshot_free(&snapshot);
+            return CBM_NOT_FOUND;
+        }
+        int emit_rc = sink->node(sink->userdata, snapshot.nodes[i].id,
+                                 snapshot.nodes[i].label ? snapshot.nodes[i].label : "",
+                                 snapshot.nodes[i].name ? snapshot.nodes[i].name : "",
+                                 snapshot.nodes[i].qualified_name
+                                     ? snapshot.nodes[i].qualified_name
+                                     : "",
+                                 snapshot.nodes[i].file_path ? snapshot.nodes[i].file_path : "",
+                                 fact_line(snapshot.nodes[i].start_line),
+                                 fact_line(snapshot.nodes[i].end_line),
+                                 props_json ? props_json : "{}");
+        free(props_json);
+        if (props_doc) {
+            yyjson_doc_free(props_doc);
+        }
+        yyjson_mut_doc_free(doc);
+        if (emit_rc != 0) {
+            cbm_gbuf_snapshot_free(&snapshot);
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    for (int i = 0; i < snapshot.edge_count; i++) {
+        if (!sink->edge) {
+            break;
+        }
+        const CBMDumpEdge *edge = &snapshot.edges[i];
+        const char *source_qn =
+            (edge->source_id > 0 && edge->source_id <= snapshot.node_count)
+                ? (snapshot.nodes[edge->source_id - SKIP_ONE].qualified_name
+                       ? snapshot.nodes[edge->source_id - SKIP_ONE].qualified_name
+                       : "")
+                : "";
+        const char *target_qn =
+            (edge->target_id > 0 && edge->target_id <= snapshot.node_count)
+                ? (snapshot.nodes[edge->target_id - SKIP_ONE].qualified_name
+                       ? snapshot.nodes[edge->target_id - SKIP_ONE].qualified_name
+                       : "")
+                : "";
+        edge_fact_payload_t payload;
+        if (edge_fact_payload_init(edge, &payload) != 0) {
+            cbm_gbuf_snapshot_free(&snapshot);
+            return CBM_NOT_FOUND;
+        }
+        int has_step = payload.step_val && yyjson_mut_is_int(payload.step_val);
+        int64_t step = has_step ? yyjson_mut_get_sint(payload.step_val) : 0;
+        int emit_rc = sink->edge(sink->userdata, edge->id, edge->source_id, source_qn,
+                                 edge->target_id, target_qn, edge->type ? edge->type : "",
+                                 payload.confidence, payload.reason, has_step, step,
+                                 payload.props_json ? payload.props_json : "{}");
+        edge_fact_payload_free(&payload);
+        if (emit_rc != 0) {
+            cbm_gbuf_snapshot_free(&snapshot);
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    if (sink->done &&
+        sink->done(sink->userdata, file_count, snapshot.node_count, snapshot.edge_count) != 0) {
+        cbm_gbuf_snapshot_free(&snapshot);
+        return CBM_NOT_FOUND;
+    }
+    cbm_gbuf_snapshot_free(&snapshot);
+    return 0;
+}
+
+typedef struct {
+    FILE *fp;
+} jsonl_fact_sink_t;
+
+static int jsonl_sink_manifest(void *userdata, const char *repo_path, int files, int nodes,
+                               int edges) {
+    jsonl_fact_sink_t *sink = userdata;
+    fprintf(sink->fp,
+            "{\"kind\":\"manifest\",\"contractVersion\":1,\"engineVersion\":\"aka-engine\","
+            "\"repoPath\":");
+    write_json_string(sink->fp, repo_path);
+    fprintf(sink->fp, ",\"generatedAt\":\"\",\"stats\":{\"files\":%d,\"nodes\":%d,\"edges\":%d,"
+                      "\"chunks\":0}}\n",
+            files, nodes, edges);
+    return 0;
+}
+
+static int jsonl_sink_node(void *userdata, int64_t cbm_id, const char *label, const char *name,
+                           const char *qualified_name, const char *file_path,
+                           int start_line_0based, int end_line_0based,
+                           const char *properties_json) {
+    (void)name;
+    (void)file_path;
+    (void)start_line_0based;
+    (void)end_line_0based;
+    jsonl_fact_sink_t *sink = userdata;
+    fprintf(sink->fp, "{\"kind\":\"node\",\"id\":");
+    write_aka_node_id(sink->fp, cbm_id, qualified_name);
+    fprintf(sink->fp, ",\"label\":");
+    write_json_string(sink->fp, label ? label : "");
+    fprintf(sink->fp, ",\"properties\":%s}\n", properties_json ? properties_json : "{}");
+    return 0;
+}
+
+static int jsonl_sink_edge(void *userdata, int64_t edge_id, int64_t source_id,
+                           const char *source_qn, int64_t target_id, const char *target_qn,
+                           const char *type, double confidence, const char *reason, int has_step,
+                           int64_t step, const char *evidence_json) {
+    jsonl_fact_sink_t *sink = userdata;
+    fprintf(sink->fp, "{\"kind\":\"edge\",\"id\":\"cbm-edge:%lld\",\"sourceId\":",
+            (long long)edge_id);
+    write_aka_node_id(sink->fp, source_id, source_qn);
+    fprintf(sink->fp, ",\"targetId\":");
+    write_aka_node_id(sink->fp, target_id, target_qn);
+    fprintf(sink->fp, ",\"type\":");
+    write_json_string(sink->fp, type ? type : "");
+    fprintf(sink->fp, ",\"confidence\":%.6g,\"reason\":", confidence);
+    write_json_string(sink->fp, reason ? reason : "");
+    if (has_step) {
+        fprintf(sink->fp, ",\"step\":%lld", (long long)step);
+    }
+    fprintf(sink->fp, ",\"evidence\":%s}\n", evidence_json ? evidence_json : "{}");
+    return 0;
+}
+
+static int jsonl_sink_done(void *userdata, int files, int nodes, int edges) {
+    jsonl_fact_sink_t *sink = userdata;
+    fprintf(sink->fp, "{\"kind\":\"done\",\"stats\":{\"files\":%d,\"nodes\":%d,\"edges\":%d,"
+                      "\"chunks\":0}}\n",
+            files, nodes, edges);
+    return 0;
 }
 
 static int emit_facts_sidecar(cbm_pipeline_t *p) {
@@ -315,56 +483,24 @@ static int emit_facts_sidecar(cbm_pipeline_t *p) {
         cbm_mkdir_p(out_dir, CBM_DIR_PERMS);
     }
 
-    cbm_gbuf_snapshot_t snapshot = {0};
-    int rc = cbm_gbuf_snapshot_build(p->gbuf, &snapshot);
-    if (rc != 0) {
-        cbm_log_error("pipeline.err", "phase", "facts_snapshot");
-        return rc;
-    }
-
     FILE *fp = fopen(tmp_path, "wb");
     if (!fp) {
-        cbm_gbuf_snapshot_free(&snapshot);
         cbm_log_error("pipeline.err", "phase", "facts_sidecar_open");
         return CBM_NOT_FOUND;
     }
 
-    int file_count = 0;
-    const char *last_file = NULL;
-    for (int i = 0; i < snapshot.node_count; i++) {
-        if (!snapshot.nodes[i].label || strcmp(snapshot.nodes[i].label, "File") != 0) {
-            continue;
-        }
-        const char *file_path = snapshot.nodes[i].file_path ? snapshot.nodes[i].file_path : "";
-        if (file_path[0] && (!last_file || strcmp(last_file, file_path) != 0)) {
-            file_count++;
-            last_file = file_path;
-        }
-    }
-
-    fprintf(fp,
-            "{\"kind\":\"manifest\",\"contractVersion\":1,\"engineVersion\":\"aka-engine\","
-            "\"repoPath\":");
-    write_json_string(fp, p->repo_path);
-    fprintf(fp, ",\"generatedAt\":\"\",\"stats\":{\"files\":%d,\"nodes\":%d,\"edges\":%d,"
-                "\"chunks\":0}}\n",
-            file_count, snapshot.node_count, snapshot.edge_count);
-    for (int i = 0; i < snapshot.node_count; i++) {
-        emit_node_fact(fp, &snapshot.nodes[i]);
-    }
-    for (int i = 0; i < snapshot.edge_count; i++) {
-        emit_edge_fact(fp, &snapshot.edges[i], snapshot.nodes, snapshot.node_count);
-    }
-    fprintf(fp, "{\"kind\":\"done\",\"stats\":{\"files\":%d,\"nodes\":%d,\"edges\":%d,"
-                "\"chunks\":0}}\n",
-            file_count, snapshot.node_count, snapshot.edge_count);
-
-    int emitted_nodes = snapshot.node_count;
+    jsonl_fact_sink_t jsonl = {.fp = fp};
+    cbm_fact_sink_t sink = {.userdata = &jsonl,
+                            .manifest = jsonl_sink_manifest,
+                            .node = jsonl_sink_node,
+                            .edge = jsonl_sink_edge,
+                            .done = jsonl_sink_done};
+    int rc = emit_facts_to_sink(p, &sink);
     int close_rc = fclose(fp);
-    cbm_gbuf_snapshot_free(&snapshot);
-    if (close_rc != 0) {
+    if (rc != 0 || close_rc != 0) {
         remove(tmp_path);
-        cbm_log_error("pipeline.err", "phase", "facts_sidecar_close");
+        cbm_log_error("pipeline.err", "phase",
+                      rc != 0 ? "facts_sidecar_emit" : "facts_sidecar_close");
         return CBM_NOT_FOUND;
     }
     if (rename(tmp_path, p->facts_output_path) != 0) {
@@ -372,7 +508,7 @@ static int emit_facts_sidecar(cbm_pipeline_t *p) {
         cbm_log_error("pipeline.err", "phase", "facts_sidecar_rename");
         return CBM_NOT_FOUND;
     }
-    cbm_log_info("pass.timing", "pass", "facts_sidecar", "nodes", itoa_buf(emitted_nodes));
+    cbm_log_info("pass.timing", "pass", "facts_sidecar");
     return 0;
 }
 
@@ -411,6 +547,12 @@ void cbm_pipeline_set_facts_output(cbm_pipeline_t *p, const char *path) {
     }
     free(p->facts_output_path);
     p->facts_output_path = (path && path[0]) ? strdup(path) : NULL;
+}
+
+void cbm_pipeline_set_fact_sink(cbm_pipeline_t *p, const cbm_fact_sink_t *sink) {
+    if (p) {
+        p->fact_sink = sink;
+    }
 }
 
 void cbm_pipeline_free(cbm_pipeline_t *p) {
@@ -1183,7 +1325,10 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     run_predump_passes(p, ctx);
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
 
-    if (!check_cancel(p)) {
+    if (!check_cancel(p) && p->fact_sink) {
+        rc = emit_facts_to_sink(p, p->fact_sink);
+    }
+    if (!check_cancel(p) && rc == 0) {
         rc = emit_facts_sidecar(p);
     }
     if (!check_cancel(p) && rc == 0) {
