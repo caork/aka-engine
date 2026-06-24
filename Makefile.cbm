@@ -221,6 +221,9 @@ WATCHER_SRCS = src/watcher/watcher.c
 # CLI module (new)
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c
 
+# Embedded public API
+API_SRCS = src/api/aka_engine.c
+
 # UI module (graph visualization)
 UI_SRCS = \
     src/ui/config.c \
@@ -279,6 +282,7 @@ YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
 PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+LIB_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(UI_SRCS) $(API_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
@@ -407,7 +411,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-foundation test-tsan cbm libaka-engine cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -439,6 +443,7 @@ $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 # mimalloc object files
 MIMALLOC_OBJ_TEST = $(BUILD_DIR)/mimalloc.o
 MIMALLOC_OBJ_PROD = $(BUILD_DIR)/prod_mimalloc.o
+MIMALLOC_OBJ_LIB = $(BUILD_DIR)/lib_mimalloc.o
 
 $(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS_TEST) -c -o $@ $<
@@ -446,9 +451,17 @@ $(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/prod_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS) -c -o $@ $<
 
+$(BUILD_DIR)/lib_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -w \
+		-Ivendored/mimalloc/include \
+		-Ivendored/mimalloc/src \
+		-DMI_OVERRIDE=0 \
+		-c -o $@ $<
+
 # sqlite3 object files (vendored amalgamation)
 SQLITE3_OBJ_TEST = $(BUILD_DIR)/sqlite3.o
 SQLITE3_OBJ_PROD = $(BUILD_DIR)/prod_sqlite3.o
+SQLITE3_OBJ_LIB = $(BUILD_DIR)/lib_sqlite3.o
 
 $(BUILD_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
@@ -456,17 +469,25 @@ $(BUILD_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS) -c -o $@ $<
 
+$(BUILD_DIR)/lib_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
+	$(CC) $(SQLITE3_CFLAGS) -c -o $@ $<
+
 # TRE regex (only compiled on Windows — POSIX uses system <regex.h>)
 TRE_OBJ_TEST :=
 TRE_OBJ_PROD :=
+TRE_OBJ_LIB :=
 ifeq ($(IS_MINGW),yes)
 TRE_OBJ_TEST = $(BUILD_DIR)/tre.o
 TRE_OBJ_PROD = $(BUILD_DIR)/prod_tre.o
+TRE_OBJ_LIB = $(BUILD_DIR)/lib_tre.o
 
 $(BUILD_DIR)/tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) $(SANITIZE) -fno-sanitize=alignment -c -o $@ $<
 
 $(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
+	$(CC) $(TRE_CFLAGS) -O2 -c -o $@ $<
+
+$(BUILD_DIR)/lib_tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) -O2 -c -o $@ $<
 endif
 
@@ -537,6 +558,7 @@ $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
+OBJS_VENDORED_LIB = $(MIMALLOC_OBJ_LIB) $(SQLITE3_OBJ_LIB) $(TRE_OBJ_LIB) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
 MAIN_SRC = src/main.c
 
@@ -549,6 +571,18 @@ $(BUILD_DIR)/aka-engine: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SR
 
 cbm: $(BUILD_DIR)/aka-engine
 	@echo "Built: $(BUILD_DIR)/aka-engine"
+
+$(BUILD_DIR)/libaka_engine.a: $(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_LIB) | $(BUILD_DIR)
+	rm -rf $(BUILD_DIR)/libobjs
+	mkdir -p $(BUILD_DIR)/libobjs
+	$(CC) $(CFLAGS_PROD) -I$(CURDIR)/src/api -c \
+		$(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
+	mv *.o $(BUILD_DIR)/libobjs/
+	cp $(OBJS_VENDORED_LIB) $(BUILD_DIR)/libobjs/
+	$(AR) rcs $@ $(BUILD_DIR)/libobjs/*.o
+
+libaka-engine: $(BUILD_DIR)/libaka_engine.a
+	@echo "Built: $(BUILD_DIR)/libaka_engine.a"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
 

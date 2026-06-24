@@ -80,6 +80,7 @@ struct cbm_pipeline {
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
     char *facts_output_path;
     const cbm_fact_sink_t *fact_sink;
+    bool skip_dump;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -538,6 +539,12 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
+    }
+}
+
+void cbm_pipeline_set_skip_dump(cbm_pipeline_t *p, bool enabled) {
+    if (p) {
+        p->skip_dump = enabled;
     }
 }
 
@@ -1331,7 +1338,7 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (!check_cancel(p) && rc == 0) {
         rc = emit_facts_sidecar(p);
     }
-    if (!check_cancel(p) && rc == 0) {
+    if (!check_cancel(p) && rc == 0 && !p->skip_dump) {
         struct timespec t;
         CBM_PROF_START(t_dump);
         rc = dump_and_persist_hashes(p, files, file_count, &t);
@@ -1416,13 +1423,21 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         goto cleanup;
     }
 
-    /* Check for existing DB → try incremental or delete for reindex */
-    rc = try_incremental_or_delete_db(p, files, file_count);
-    if (rc >= 0) {
-        cbm_discover_free(files, file_count);
-        return rc;
+    /* Check for existing DB → try incremental or delete for reindex.
+     * Embedded direct-facts runs skip engine SQLite entirely; Rust owns cache,
+     * graph, and search persistence in that path. */
+    if (!p->skip_dump) {
+        rc = try_incremental_or_delete_db(p, files, file_count);
+        if (rc >= 0) {
+            cbm_discover_free(files, file_count);
+            return rc;
+        }
+    } else {
+        cbm_log_info("pipeline.route", "path", "direct_facts");
     }
-    cbm_log_info("pipeline.route", "path", "full");
+    if (!p->skip_dump) {
+        cbm_log_info("pipeline.route", "path", "full");
+    }
 
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);
