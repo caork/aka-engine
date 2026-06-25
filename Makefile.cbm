@@ -45,6 +45,15 @@ GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
                   -Wno-stringop-truncation -Wno-alloc-size-larger-than
 endif
 
+# PIC=1 builds object files suitable for linking into a shared object. Linux
+# desktop packaging needs this because Tauri links the embedded engine archive
+# into its cdylib.
+ifeq ($(PIC),1)
+PIC_FLAGS := -fPIC
+else
+PIC_FLAGS :=
+endif
+
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 -Wno-unused-parameter -Wno-sign-compare \
                 $(GCC_ONLY_FLAGS) \
@@ -61,8 +70,8 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
-CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
+CFLAGS_PROD = $(CFLAGS_COMMON) -O2 $(PIC_FLAGS) -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
+CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2 $(PIC_FLAGS)
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -258,6 +267,7 @@ ifeq ($(IS_MINGW),yes)
 MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
 endif
 MIMALLOC_CFLAGS = -std=c11 -O2 -w \
+                  $(PIC_FLAGS) \
                   -Ivendored/mimalloc/include \
                   -Ivendored/mimalloc/src \
                   -DMI_OVERRIDE=1 \
@@ -271,12 +281,12 @@ MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
 # BM25 search path in search_graph (see nodes_fts virtual table in store.c).
 SQLITE3_SRC = vendored/sqlite3/sqlite3.c
-SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
+SQLITE3_CFLAGS = -std=c11 -O2 -w $(PIC_FLAGS) -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
 SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c
-TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
+TRE_CFLAGS = -std=c11 -g -O1 -w $(PIC_FLAGS) -Ivendored/tre
 
 # yyjson (vendored)
 YYJSON_SRC = vendored/yyjson/yyjson.c
@@ -398,7 +408,7 @@ BUILD_DIR = build/c
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
-GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w $(PIC_FLAGS) -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       $(SANITIZE)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
@@ -453,7 +463,7 @@ $(BUILD_DIR)/prod_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/lib_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
-	$(CC) -std=c11 -O2 -w \
+	$(CC) -std=c11 -O2 -w $(PIC_FLAGS) \
 		-Ivendored/mimalloc/include \
 		-Ivendored/mimalloc/src \
 		-DMI_OVERRIDE=0 \
@@ -507,7 +517,7 @@ $(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 # nomic-embed-code pretrained vector blob
 UNIXCODER_OBJ = $(BUILD_DIR)/unixcoder_blob.o
 $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
-	$(CC) -c -o $@ $<
+	$(CC) $(PIC_FLAGS) -c -o $@ $<
 
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 
@@ -549,14 +559,14 @@ $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 # Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)
 LZ4_OBJ_PROD = $(BUILD_DIR)/prod_lz4.o $(BUILD_DIR)/prod_lz4hc.o
 $(BUILD_DIR)/prod_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(PIC_FLAGS) -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/prod_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(PIC_FLAGS) -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 # Vendored zstd (compiled separately, not unity-built via zstd_store.c)
 ZSTD_OBJ_PROD = $(BUILD_DIR)/prod_zstd.o
 $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(PIC_FLAGS) -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 OBJS_VENDORED_LIB = $(MIMALLOC_OBJ_LIB) $(SQLITE3_OBJ_LIB) $(TRE_OBJ_LIB) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
@@ -583,7 +593,7 @@ $(BUILD_DIR)/libaka_engine.a: $(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZS
 		obj="$(BUILD_DIR)/libobjs/$$(basename "$${src%.*}").o"; \
 		$(CC) $(CFLAGS_PROD) -I$(CURDIR)/src/api -c "$$src" -o "$$obj"; \
 	done
-	$(MAKE) -f Makefile.cbm BUILD_DIR=$(BUILD_DIR)/libobjs CC="$(CC)" CXX="$(CXX)" AR="$(AR)" embedded-vendored-objs
+	$(MAKE) -f Makefile.cbm BUILD_DIR=$(BUILD_DIR)/libobjs CC="$(CC)" CXX="$(CXX)" AR="$(AR)" PIC="$(PIC)" embedded-vendored-objs
 	$(AR) rcs $@ $(BUILD_DIR)/libobjs/*.o
 
 libaka-engine: $(BUILD_DIR)/libaka_engine.a
