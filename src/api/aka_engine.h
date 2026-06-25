@@ -11,6 +11,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#if defined(_WIN32) && defined(AKA_ENGINE_BUILD_DLL)
+#define AKA_ENGINE_API __declspec(dllexport)
+#else
+#define AKA_ENGINE_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -43,8 +49,8 @@ typedef struct {
 /* Returns 0 on success, nonzero on failure. The fact sink is borrowed for the
  * duration of the call. If direct_facts_only is true, the engine emits facts but
  * skips its SQLite dump/persistence; Rust owns graph/search persistence. */
-int aka_engine_index_with_sink(const aka_engine_index_options_t *options,
-                               const aka_engine_fact_sink_t *sink);
+AKA_ENGINE_API int aka_engine_index_with_sink(const aka_engine_index_options_t *options,
+                                              const aka_engine_fact_sink_t *sink);
 
 #ifdef __cplusplus
 }

@@ -90,6 +90,7 @@ STATIC_FLAGS := -static
 endif
 
 LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS)
+LDFLAGS_EMBEDDED = -lm -lstdc++ -lpthread $(LIBGIT2_LIBS) $(WIN32_LIBS)
 LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
 LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS)
 
@@ -282,7 +283,7 @@ YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
 PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
-LIB_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(UI_SRCS) $(API_SRCS) $(YYJSON_SRC)
+LIB_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(API_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
@@ -411,7 +412,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan cbm libaka-engine cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-foundation test-tsan cbm libaka-engine aka-engine-dll embedded-vendored-objs cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -560,6 +561,9 @@ $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 OBJS_VENDORED_LIB = $(MIMALLOC_OBJ_LIB) $(SQLITE3_OBJ_LIB) $(TRE_OBJ_LIB) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
+embedded-vendored-objs: $(OBJS_VENDORED_LIB)
+	@true
+
 MAIN_SRC = src/main.c
 
 $(BUILD_DIR)/aka-engine: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
@@ -572,17 +576,36 @@ $(BUILD_DIR)/aka-engine: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SR
 cbm: $(BUILD_DIR)/aka-engine
 	@echo "Built: $(BUILD_DIR)/aka-engine"
 
-$(BUILD_DIR)/libaka_engine.a: $(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_LIB) | $(BUILD_DIR)
+$(BUILD_DIR)/libaka_engine.a: $(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MIMALLOC_SRC) $(SQLITE3_SRC) $(TRE_SRC) $(GRAMMAR_SRCS) $(CBM_DIR)/ts_runtime.c $(CBM_DIR)/lsp_all.c $(CBM_DIR)/preprocessor.cpp $(CBM_DIR)/vendored/lz4/lz4.c $(CBM_DIR)/vendored/lz4/lz4hc.c $(CBM_DIR)/vendored/zstd/zstd.c $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
 	rm -rf $(BUILD_DIR)/libobjs
 	mkdir -p $(BUILD_DIR)/libobjs
-	$(CC) $(CFLAGS_PROD) -I$(CURDIR)/src/api -c \
-		$(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
-	mv *.o $(BUILD_DIR)/libobjs/
-	cp $(OBJS_VENDORED_LIB) $(BUILD_DIR)/libobjs/
+	@for src in $(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC); do \
+		obj="$(BUILD_DIR)/libobjs/$$(basename "$${src%.*}").o"; \
+		$(CC) $(CFLAGS_PROD) -I$(CURDIR)/src/api -c "$$src" -o "$$obj"; \
+	done
+	$(MAKE) -f Makefile.cbm BUILD_DIR=$(BUILD_DIR)/libobjs CC="$(CC)" CXX="$(CXX)" AR="$(AR)" embedded-vendored-objs
 	$(AR) rcs $@ $(BUILD_DIR)/libobjs/*.o
 
 libaka-engine: $(BUILD_DIR)/libaka_engine.a
 	@echo "Built: $(BUILD_DIR)/libaka_engine.a"
+
+$(BUILD_DIR)/aka_engine.dll: $(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MIMALLOC_SRC) $(SQLITE3_SRC) $(TRE_SRC) $(GRAMMAR_SRCS) $(CBM_DIR)/ts_runtime.c $(CBM_DIR)/lsp_all.c $(CBM_DIR)/preprocessor.cpp $(CBM_DIR)/vendored/lz4/lz4.c $(CBM_DIR)/vendored/lz4/lz4hc.c $(CBM_DIR)/vendored/zstd/zstd.c $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
+	@if [ "$(IS_MINGW)" != "yes" ]; then \
+		echo "error: aka_engine.dll target requires a Windows/MinGW compiler" >&2; \
+		exit 1; \
+	fi
+	rm -rf $(BUILD_DIR)/dllobjs
+	mkdir -p $(BUILD_DIR)/dllobjs
+	@for src in $(LIB_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC); do \
+		obj="$(BUILD_DIR)/dllobjs/$$(basename "$${src%.*}").o"; \
+		$(CC) $(CFLAGS_PROD) -DAKA_ENGINE_BUILD_DLL -I$(CURDIR)/src/api -c "$$src" -o "$$obj"; \
+	done
+	$(MAKE) -f Makefile.cbm BUILD_DIR=$(BUILD_DIR)/dllobjs CC="$(CC)" CXX="$(CXX)" AR="$(AR)" embedded-vendored-objs
+	$(CC) -shared -o $@ $(BUILD_DIR)/dllobjs/*.o \
+		$(LDFLAGS_EMBEDDED) -Wl,--out-implib,$(BUILD_DIR)/libaka_engine.dll.a
+
+aka-engine-dll: $(BUILD_DIR)/aka_engine.dll
+	@echo "Built: $(BUILD_DIR)/aka_engine.dll"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
