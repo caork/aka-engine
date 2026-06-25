@@ -515,8 +515,9 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
     int errors = 0;
 
     for (int i = 0; i < file_count; i++) {
-        if (cbm_pipeline_check_cancel(ctx)) {
-            return CBM_NOT_FOUND;
+        int cancel_rc = cbm_pipeline_check_cancel(ctx);
+        if (cancel_rc != 0) {
+            return cancel_rc;
         }
 
         const char *rel = files[i].rel_path;

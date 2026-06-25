@@ -635,9 +635,10 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     recs.cap = recs.items ? K8S_MAX_RECORDS : 0;
 
     for (int i = 0; i < file_count; i++) {
-        if (cbm_pipeline_check_cancel(ctx)) {
+        int cancel_rc = cbm_pipeline_check_cancel(ctx);
+        if (cancel_rc != 0) {
             free(recs.items);
-            return CBM_NOT_FOUND;
+            return cancel_rc;
         }
 
         const char *path = files[i].path;

@@ -314,8 +314,9 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
     int errors = 0;
 
     for (int i = 0; i < file_count; i++) {
-        if (cbm_pipeline_check_cancel(ctx)) {
-            return CBM_NOT_FOUND;
+        int cancel_rc = cbm_pipeline_check_cancel(ctx);
+        if (cancel_rc != 0) {
+            return cancel_rc;
         }
 
         const char *path = files[i].path;

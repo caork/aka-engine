@@ -103,6 +103,11 @@ typedef struct {
     int64_t max_file_size;   /* 0 = no limit */
 } cbm_discover_opts_t;
 
+typedef struct {
+    void *userdata;
+    int (*should_cancel)(void *userdata);
+} cbm_discover_cancel_t;
+
 /* Walk a repository directory tree and discover all source files.
  * Applies hardcoded filters, gitignore patterns, and language detection.
  * Returns 0 on success, -1 on error.
@@ -121,6 +126,12 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
  * Returns 0 on success, -1 on error. */
 int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                     int *count, char ***excluded_out, int *excluded_count_out);
+
+/* Like cbm_discover_ex(), but checks should_cancel at directory/entry
+ * boundaries. Returns CBM_CANCELLED when cancellation is requested. */
+int cbm_discover_ex_cancelable(const char *repo_path, const cbm_discover_opts_t *opts,
+                               cbm_file_info_t **out, int *count, char ***excluded_out,
+                               int *excluded_count_out, const cbm_discover_cancel_t *cancel);
 
 /* Free an array of file info results. NULL-safe. */
 void cbm_discover_free(cbm_file_info_t *files, int count);

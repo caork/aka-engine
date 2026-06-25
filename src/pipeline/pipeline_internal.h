@@ -57,6 +57,7 @@ typedef struct {
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
+    const cbm_pipeline_callbacks_t *callbacks; /* borrowed from pipeline */
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
 
     /* Extraction result cache (sequential pipeline optimization).
@@ -129,9 +130,14 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
 void cbm_pkgmap_free(CBMHashTable *pkgmap);
 
 /* Check cancellation. Returns non-zero if cancelled. */
+int cbm_pipeline_check_cancel_ctx(const cbm_pipeline_ctx_t *ctx);
+
 static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
-    return atomic_load(ctx->cancelled) ? CBM_NOT_FOUND : 0;
+    return cbm_pipeline_check_cancel_ctx(ctx);
 }
+
+int cbm_pipeline_emit_progress_ctx(const cbm_pipeline_ctx_t *ctx, const char *phase,
+                                   const char *file_path, int current, int total);
 
 /* ── Testable helpers ────────────────────────────────────────────── */
 

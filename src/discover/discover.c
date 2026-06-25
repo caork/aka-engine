@@ -551,12 +551,16 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
 
 enum { GI_OWNED_CAP = 64 };
 
-static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
-                     const cbm_gitignore_t *gitignore, const cbm_gitignore_t *cbmignore,
-                     file_list_t *out) {
+static int discover_should_cancel(const cbm_discover_cancel_t *cancel) {
+    return cancel && cancel->should_cancel && cancel->should_cancel(cancel->userdata) != 0;
+}
+
+static int walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
+                    const cbm_gitignore_t *gitignore, const cbm_gitignore_t *cbmignore,
+                    file_list_t *out, const cbm_discover_cancel_t *cancel) {
     walk_frame_t *stack = calloc(WALK_STACK_CAP, sizeof(walk_frame_t));
     if (!stack) {
-        return;
+        return CBM_NOT_FOUND;
     }
     /* Collect all owned gitignores — freed at the end because child frames
      * on the stack hold borrowed pointers to them. */
@@ -568,7 +572,12 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
     snprintf(stack[top].prefix, CBM_SZ_4K, "%s", rel_prefix);
     top++;
 
+    int rc = 0;
     while (top > 0) {
+        if (discover_should_cancel(cancel)) {
+            rc = CBM_CANCELLED;
+            break;
+        }
         walk_frame_t frame = stack[--top];
 
         cbm_gitignore_t *loaded = try_load_nested_gitignore(&frame);
@@ -587,14 +596,22 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
 
         cbm_dirent_t *entry;
         while ((entry = cbm_readdir(d)) != NULL) {
+            if (discover_should_cancel(cancel)) {
+                rc = CBM_CANCELLED;
+                break;
+            }
             walk_dir_process_entry(entry, &frame, opts, gitignore, cbmignore, stack, &top, out);
         }
         cbm_closedir(d);
+        if (rc != 0) {
+            break;
+        }
     }
     for (int i = 0; i < owned_count; i++) {
         cbm_gitignore_free(owned_gis[i]);
     }
     free(stack);
+    return rc;
 }
 
 /* ── Public API ───────────────────────────────── */
@@ -606,6 +623,13 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
 
 int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                     int *count, char ***excluded_out, int *excluded_count_out) {
+    return cbm_discover_ex_cancelable(repo_path, opts, out, count, excluded_out,
+                                      excluded_count_out, NULL);
+}
+
+int cbm_discover_ex_cancelable(const char *repo_path, const cbm_discover_opts_t *opts,
+                               cbm_file_info_t **out, int *count, char ***excluded_out,
+                               int *excluded_count_out, const cbm_discover_cancel_t *cancel) {
     if (excluded_out) {
         *excluded_out = NULL;
     }
@@ -646,11 +670,17 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
 
     /* Walk */
     file_list_t fl = {0};
-    walk_dir(repo_path, "", opts, gitignore, cbmignore, &fl);
+    int walk_rc = walk_dir(repo_path, "", opts, gitignore, cbmignore, &fl, cancel);
 
     /* Cleanup */
     cbm_gitignore_free(gitignore);
     cbm_gitignore_free(cbmignore);
+
+    if (walk_rc != 0) {
+        cbm_discover_free(fl.files, fl.count);
+        cbm_discover_free_excluded(fl.excluded, fl.excluded_count);
+        return walk_rc;
+    }
 
     *out = fl.files;
     *count = fl.count;

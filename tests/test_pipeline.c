@@ -11,6 +11,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
+#include "api/aka_engine.h"
 #include <yyjson/yyjson.h> // properties-JSON validity (oversized-props regression)
 
 #include <stdlib.h>
@@ -138,6 +139,63 @@ TEST(pipeline_cancel_null) {
 TEST(pipeline_run_null) {
     int rc = cbm_pipeline_run(NULL);
     ASSERT_EQ(rc, -1);
+    PASS();
+}
+
+typedef struct {
+    int progress_calls;
+    int cancel_checks;
+} api_cancel_test_t;
+
+static int api_cancel_progress(void *userdata, const char *phase, const char *file_path,
+                               int current, int total, int nodes, int edges) {
+    (void)phase;
+    (void)file_path;
+    (void)current;
+    (void)total;
+    (void)nodes;
+    (void)edges;
+    api_cancel_test_t *state = userdata;
+    state->progress_calls++;
+    return 0;
+}
+
+static int api_cancel_should_cancel(void *userdata) {
+    api_cancel_test_t *state = userdata;
+    state->cancel_checks++;
+    return state->progress_calls > 0;
+}
+
+TEST(aka_engine_api_callback_cancel) {
+    ASSERT_EQ(setup_test_repo(), 0);
+    api_cancel_test_t state = {0};
+    aka_engine_callbacks_t callbacks = {
+        .userdata = &state,
+        .progress = api_cancel_progress,
+        .log = NULL,
+        .should_cancel = api_cancel_should_cancel,
+    };
+    aka_engine_index_options_t options = {
+        .repo_path = g_tmpdir,
+        .cache_dir = NULL,
+        .mode = AKA_ENGINE_MODE_FAST,
+        .direct_facts_only = true,
+        .deadline_ms_monotonic = 0,
+        .max_indexing_time_ms = 0,
+    };
+    aka_engine_fact_sink_t sink = {
+        .userdata = NULL,
+        .manifest = NULL,
+        .node = NULL,
+        .edge = NULL,
+        .done = NULL,
+        .callbacks = &callbacks,
+    };
+    int rc = aka_engine_index_with_sink(&options, &sink);
+    ASSERT_EQ(rc, AKA_ENGINE_CANCELLED);
+    ASSERT_TRUE(state.progress_calls > 0);
+    ASSERT_TRUE(state.cancel_checks > 0);
+    th_rmtree(g_tmpdir);
     PASS();
 }
 
@@ -5679,6 +5737,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel);
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
+    RUN_TEST(aka_engine_api_callback_cancel);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);

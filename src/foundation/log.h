@@ -59,6 +59,10 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
 
 /* Optional log sink callback — called with the formatted log line. */
 typedef void (*cbm_log_sink_fn)(const char *line);
+typedef void (*cbm_log_sink_ex_fn)(CBMLogLevel level, const char *line, void *userdata);
 void cbm_log_set_sink(cbm_log_sink_fn fn);
+void cbm_log_set_sink_ex(cbm_log_sink_ex_fn fn, void *userdata);
+void cbm_log_get_sink_state(cbm_log_sink_fn *legacy, cbm_log_sink_ex_fn *extended,
+                            void **userdata);
 
 #endif /* CBM_LOG_H */

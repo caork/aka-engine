@@ -65,6 +65,7 @@ enum { TS_LINE_OFFSET = 1 };
 /* ── Sentinel values ─────────────────────────────────────────── */
 enum {
     CBM_NOT_FOUND = -1, /* search miss, invalid index */
+    CBM_CANCELLED = -2, /* cooperative cancellation / deadline exceeded */
     CBM_INIT_DONE = 1,  /* initialization flag */
 };
 

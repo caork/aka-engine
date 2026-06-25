@@ -482,10 +482,31 @@ typedef struct {
     _Atomic int64_t *shared_ids;
     _Atomic int *cancelled;
     _Atomic int next_file_idx;
+    const cbm_pipeline_callbacks_t *callbacks;
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
     _Atomic int64_t retained_bytes; /* total source bytes copied into result arenas */
 } extract_ctx_t;
+
+static int extract_should_cancel(extract_ctx_t *ec) {
+    if (!ec || atomic_load_explicit(ec->cancelled, memory_order_relaxed)) {
+        return CBM_CANCELLED;
+    }
+    const cbm_pipeline_callbacks_t *callbacks = ec->callbacks;
+    if (callbacks) {
+        if (callbacks->deadline_ms_monotonic > 0 &&
+            (extract_now_ns() / PP_USEC_PER_MS) >= callbacks->deadline_ms_monotonic) {
+            atomic_store_explicit(ec->cancelled, 1, memory_order_relaxed);
+            return CBM_CANCELLED;
+        }
+        if (callbacks->should_cancel &&
+            callbacks->should_cancel(callbacks->userdata) != 0) {
+            atomic_store_explicit(ec->cancelled, 1, memory_order_relaxed);
+            return CBM_CANCELLED;
+        }
+    }
+    return 0;
+}
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
 static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
@@ -544,7 +565,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         if (sort_pos >= ec->file_count) {
             break;
         }
-        if (atomic_load_explicit(ec->cancelled, memory_order_relaxed)) {
+        if (extract_should_cancel(ec) != 0) {
             break;
         }
 
@@ -656,6 +677,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         if ((sort_pos + SKIP_ONE) % PP_LOG_INTERVAL == 0 || sort_pos + SKIP_ONE == ec->file_count) {
             cbm_log_info("parallel.extract.progress", "done", itoa_log(sort_pos + SKIP_ONE),
                          "total", itoa_log(ec->file_count));
+            (void)extract_should_cancel(ec);
         }
 
         /* Reclaim all slab + tier2 memory between files.
@@ -767,6 +789,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .result_cache = result_cache,
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
+        .callbacks = ctx->callbacks,
         .pkg_entries = pkg_entries,
     };
     atomic_init(&ec.next_worker_id, 0);
@@ -778,6 +801,31 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_parallel_for(worker_count, extract_worker, &ec, opts);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
+    int progress_done = atomic_load_explicit(&ec.next_file_idx, memory_order_relaxed);
+    if (progress_done > file_count) {
+        progress_done = file_count;
+    }
+    int progress_rc =
+        cbm_pipeline_emit_progress_ctx(ctx, "parallel_extract", "", progress_done, file_count);
+    if (progress_rc != 0) {
+        atomic_store(ctx->cancelled, 1);
+    }
+    if (atomic_load(ctx->cancelled)) {
+        for (int i = 0; i < worker_count; i++) {
+            if (workers[i].local_gbuf) {
+                cbm_gbuf_free(workers[i].local_gbuf);
+            }
+        }
+        if (pkg_entries) {
+            for (int i = 0; i < worker_count; i++) {
+                cbm_pkg_entries_free(&pkg_entries[i]);
+            }
+            free(pkg_entries);
+        }
+        cbm_aligned_free(workers);
+        free(sorted);
+        return CBM_CANCELLED;
+    }
 
     /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not thread-safe) */
     CBM_PROF_START(t_merge);
@@ -799,7 +847,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     free(sorted);
 
     if (atomic_load(ctx->cancelled)) {
-        return CBM_NOT_FOUND;
+        return CBM_CANCELLED;
     }
 
     log_extract_mem_stats(worker_count);
@@ -939,9 +987,10 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     free(rels);
 
     for (int i = 0; i < file_count; i++) {
-        if (cbm_pipeline_check_cancel(ctx)) {
+        int cancel_rc = cbm_pipeline_check_cancel(ctx);
+        if (cancel_rc != 0) {
             cbm_pipeline_namespace_map_free(namespace_map);
-            return CBM_NOT_FOUND;
+            return cancel_rc;
         }
 
         CBMFileResult *result = result_cache[i];
@@ -997,6 +1046,7 @@ typedef struct {
     const cbm_registry_t *registry; /* READ-ONLY during Phase 4 */
     _Atomic int64_t *shared_ids;
     _Atomic int *cancelled;
+    const cbm_pipeline_callbacks_t *callbacks;
     _Atomic int next_file_idx;
 
     /* Cross-file LSP inputs — pre-built once by the caller in pipeline.c
@@ -1049,6 +1099,26 @@ typedef struct {
     _Atomic uint64_t time_ns_rc_emit;       /* emit_service_edge */
     _Atomic uint64_t time_ns_rc_source;     /* find_source_node */
 } resolve_ctx_t;
+
+static int resolve_should_cancel(resolve_ctx_t *rc) {
+    if (!rc || atomic_load_explicit(rc->cancelled, memory_order_relaxed)) {
+        return CBM_CANCELLED;
+    }
+    const cbm_pipeline_callbacks_t *callbacks = rc->callbacks;
+    if (callbacks) {
+        if (callbacks->deadline_ms_monotonic > 0 &&
+            (extract_now_ns() / PP_USEC_PER_MS) >= callbacks->deadline_ms_monotonic) {
+            atomic_store_explicit(rc->cancelled, 1, memory_order_relaxed);
+            return CBM_CANCELLED;
+        }
+        if (callbacks->should_cancel &&
+            callbacks->should_cancel(callbacks->userdata) != 0) {
+            atomic_store_explicit(rc->cancelled, 1, memory_order_relaxed);
+            return CBM_CANCELLED;
+        }
+    }
+    return 0;
+}
 
 /* Minimum buffer space needed per arg JSON object */
 #define CBM_ARG_JSON_GUARD CBM_SZ_32
@@ -2072,7 +2142,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         if (file_idx >= rc->file_count) {
             break;
         }
-        if (atomic_load_explicit(rc->cancelled, memory_order_relaxed)) {
+        if (resolve_should_cancel(rc) != 0) {
             break;
         }
 
@@ -2162,6 +2232,14 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         cbm_registry_resolve_cache_begin(result->calls.count + result->usages.count + 64);
 
         char *module_qn = cbm_pipeline_fqn_module(rc->project_name, rel);
+        if (resolve_should_cancel(rc) != 0) {
+            cbm_registry_reach_cache_end();
+            cbm_registry_import_map_cache_end();
+            cbm_registry_resolve_cache_end();
+            free(module_qn);
+            free_import_map(imp_keys, imp_vals, imp_count);
+            break;
+        }
 
         /* ── Cross-file LSP (FUSED) ─────────────────────────────
          * Runs BEFORE resolve_file_calls so its additions to
@@ -2317,6 +2395,14 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                                  itoa_log((int)lsp_elapsed_ms), "path", rel);
                 }
                 atomic_fetch_add_explicit(&rc->lsp_cross_processed, SKIP_ONE, memory_order_relaxed);
+                if (resolve_should_cancel(rc) != 0) {
+                    cbm_registry_reach_cache_end();
+                    cbm_registry_import_map_cache_end();
+                    cbm_registry_resolve_cache_end();
+                    free(module_qn);
+                    free_import_map(imp_keys, imp_vals, imp_count);
+                    break;
+                }
             } else {
                 atomic_fetch_add_explicit(&rc->lsp_cross_skipped_no_source, SKIP_ONE,
                                           memory_order_relaxed);
@@ -2402,6 +2488,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .registry = ctx->registry,
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
+        .callbacks = ctx->callbacks,
         .all_defs = all_defs,
         .def_count = def_count,
         .def_modules = def_modules,
@@ -2440,11 +2527,15 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     cbm_aligned_free(workers);
 
+    if (resolve_should_cancel(&rc) != 0) {
+        return CBM_CANCELLED;
+    }
+
     /* Go-style implicit interface satisfaction (needs full graph, serial) */
     int go_impl = cbm_pipeline_implements_go(ctx);
 
     if (atomic_load(ctx->cancelled)) {
-        return CBM_NOT_FOUND;
+        return CBM_CANCELLED;
     }
 
     /* Summary metric that replaces the removed `pass.timing pass=lsp_cross`

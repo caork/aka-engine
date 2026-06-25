@@ -42,6 +42,14 @@ typedef struct {
     int (*done)(void *userdata, int files, int nodes, int edges);
 } cbm_fact_sink_t;
 
+typedef struct {
+    void *userdata;
+    int (*progress)(void *userdata, const char *phase, const char *file_path, int current,
+                    int total, int nodes, int edges);
+    int (*should_cancel)(void *userdata);
+    uint64_t deadline_ms_monotonic; /* 0 disables */
+} cbm_pipeline_callbacks_t;
+
 /* ── Index mode ─────────────────────────────────────────────────── */
 
 #ifndef CBM_INDEX_MODE_T_DEFINED
@@ -69,20 +77,20 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
  * in-process facts where Rust owns graph/search persistence. */
 void cbm_pipeline_set_skip_dump(cbm_pipeline_t *p, bool enabled);
 
-/* Emit dump-ready facts to a sidecar JSONL file after predump passes and before
- * SQLite persistence. Intended for the fused Rust runtime transport. */
-void cbm_pipeline_set_facts_output(cbm_pipeline_t *p, const char *path);
-
 /* Emit dump-ready facts to a callback sink after predump passes and before
  * SQLite persistence. The sink is borrowed; the caller must keep it alive until
- * cbm_pipeline_run returns. The JSONL sidecar remains a built-in sink and may
- * be enabled at the same time for debugging. */
+ * cbm_pipeline_run returns. */
 void cbm_pipeline_set_fact_sink(cbm_pipeline_t *p, const cbm_fact_sink_t *sink);
+
+/* Set optional cooperative progress/cancel callbacks. The callbacks are
+ * borrowed until cbm_pipeline_run returns. */
+void cbm_pipeline_set_callbacks(cbm_pipeline_t *p, const cbm_pipeline_callbacks_t *callbacks);
 
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
-/* Run the full indexing pipeline. Returns 0 on success, -1 on error.
+/* Run the full indexing pipeline. Returns 0 on success, CBM_CANCELLED on
+ * cooperative cancellation, and a negative error code otherwise.
  * Discovers files, extracts, resolves, and dumps to SQLite. */
 int cbm_pipeline_run(cbm_pipeline_t *p);
 

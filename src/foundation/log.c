@@ -13,6 +13,8 @@
 
 static CBMLogLevel g_log_level = CBM_LOG_INFO;
 static cbm_log_sink_fn g_log_sink = NULL;
+static cbm_log_sink_ex_fn g_log_sink_ex = NULL;
+static void *g_log_sink_userdata = NULL;
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
@@ -53,6 +55,27 @@ void cbm_log_init_from_env(void) {
 
 void cbm_log_set_sink(cbm_log_sink_fn fn) {
     g_log_sink = fn;
+    g_log_sink_ex = NULL;
+    g_log_sink_userdata = NULL;
+}
+
+void cbm_log_set_sink_ex(cbm_log_sink_ex_fn fn, void *userdata) {
+    g_log_sink = NULL;
+    g_log_sink_ex = fn;
+    g_log_sink_userdata = userdata;
+}
+
+void cbm_log_get_sink_state(cbm_log_sink_fn *legacy, cbm_log_sink_ex_fn *extended,
+                            void **userdata) {
+    if (legacy) {
+        *legacy = g_log_sink;
+    }
+    if (extended) {
+        *extended = g_log_sink_ex;
+    }
+    if (userdata) {
+        *userdata = g_log_sink_userdata;
+    }
 }
 
 void cbm_log_set_level(CBMLogLevel level) {
@@ -107,7 +130,9 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
 
     /* When a sink is registered it takes over all output (exclusive).
      * Otherwise write structured log to stderr. */
-    if (g_log_sink) {
+    if (g_log_sink_ex) {
+        g_log_sink_ex(level, line_buf, g_log_sink_userdata);
+    } else if (g_log_sink) {
         g_log_sink(line_buf);
     } else {
         (void)fprintf(stderr, "%s\n", line_buf);
@@ -123,7 +148,9 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
     snprintf(line_buf, sizeof(line_buf), "level=%s msg=%s %s=%" PRId64, level_str(level),
              msg ? msg : "", key ? key : "?", value);
 
-    if (g_log_sink) {
+    if (g_log_sink_ex) {
+        g_log_sink_ex(level, line_buf, g_log_sink_userdata);
+    } else if (g_log_sink) {
         g_log_sink(line_buf);
     } else {
         (void)fprintf(stderr, "%s\n", line_buf);

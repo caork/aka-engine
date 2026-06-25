@@ -9,14 +9,61 @@
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/profile.h"
+#include "foundation/compat_thread.h"
 #include "pipeline/pipeline.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     const aka_engine_fact_sink_t *outer;
 } sink_bridge_t;
+
+uint64_t aka_engine_monotonic_ms(void) {
+    struct timespec now;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &now);
+    return ((uint64_t)now.tv_sec * CBM_MSEC_PER_SEC) +
+           ((uint64_t)now.tv_nsec / CBM_NSEC_PER_MSEC);
+}
+
+static aka_engine_log_level_t to_api_log_level(CBMLogLevel level) {
+    switch (level) {
+    case CBM_LOG_DEBUG:
+        return AKA_ENGINE_LOG_DEBUG;
+    case CBM_LOG_INFO:
+        return AKA_ENGINE_LOG_INFO;
+    case CBM_LOG_WARN:
+        return AKA_ENGINE_LOG_WARN;
+    case CBM_LOG_ERROR:
+    default:
+        return AKA_ENGINE_LOG_ERROR;
+    }
+}
+
+static void bridge_log(CBMLogLevel level, const char *line, void *userdata) {
+    const aka_engine_callbacks_t *callbacks = userdata;
+    if (callbacks && callbacks->log) {
+        callbacks->log(callbacks->userdata, to_api_log_level(level), line ? line : "");
+    }
+}
+
+static int bridge_progress(void *userdata, const char *phase, const char *file_path, int current,
+                           int total, int nodes, int edges) {
+    const aka_engine_callbacks_t *callbacks = userdata;
+    if (!callbacks || !callbacks->progress) {
+        return 0;
+    }
+    return callbacks->progress(callbacks->userdata, phase, file_path, current, total, nodes, edges);
+}
+
+static int bridge_should_cancel(void *userdata) {
+    const aka_engine_callbacks_t *callbacks = userdata;
+    if (!callbacks || !callbacks->should_cancel) {
+        return 0;
+    }
+    return callbacks->should_cancel(callbacks->userdata);
+}
 
 static cbm_index_mode_t to_cbm_mode(aka_engine_mode_t mode) {
     switch (mode) {
@@ -79,13 +126,48 @@ static int set_cache_dir(const char *cache_dir) {
     return cbm_setenv("AKA_ENGINE_CACHE_DIR", cache_dir, 1);
 }
 
+static void restore_log_sink(cbm_log_sink_fn legacy, cbm_log_sink_ex_fn extended,
+                             void *userdata) {
+    if (extended) {
+        cbm_log_set_sink_ex(extended, userdata);
+    } else {
+        cbm_log_set_sink(legacy);
+    }
+}
+
+static int api_should_cancel(const cbm_pipeline_callbacks_t *callbacks) {
+    if (!callbacks) {
+        return 0;
+    }
+    if (callbacks->deadline_ms_monotonic > 0 &&
+        aka_engine_monotonic_ms() >= callbacks->deadline_ms_monotonic) {
+        return CBM_CANCELLED;
+    }
+    if (callbacks->should_cancel && callbacks->should_cancel(callbacks->userdata) != 0) {
+        return CBM_CANCELLED;
+    }
+    return 0;
+}
+
+static int pipeline_lock_cooperative(const cbm_pipeline_callbacks_t *callbacks) {
+    struct timespec wait = {0, 100000000};
+    while (!cbm_pipeline_try_lock()) {
+        int cancel_rc = api_should_cancel(callbacks);
+        if (cancel_rc != 0) {
+            return cancel_rc;
+        }
+        cbm_nanosleep(&wait, NULL);
+    }
+    return 0;
+}
+
 int aka_engine_index_with_sink(const aka_engine_index_options_t *options,
                                const aka_engine_fact_sink_t *sink) {
     if (!options || !options->repo_path || !options->repo_path[0] || !sink) {
-        return CBM_NOT_FOUND;
+        return AKA_ENGINE_ERROR;
     }
     if (set_cache_dir(options->cache_dir) != 0) {
-        return CBM_NOT_FOUND;
+        return AKA_ENGINE_ERROR;
     }
 
     cbm_alloc_init();
@@ -93,10 +175,11 @@ int aka_engine_index_with_sink(const aka_engine_index_options_t *options,
     cbm_log_init_from_env();
     cbm_mem_init(0.5);
 
+    const aka_engine_callbacks_t *callbacks = sink->callbacks;
     cbm_pipeline_t *pipeline =
         cbm_pipeline_new(options->repo_path, NULL, to_cbm_mode(options->mode));
     if (!pipeline) {
-        return CBM_NOT_FOUND;
+        return AKA_ENGINE_ERROR;
     }
 
     sink_bridge_t bridge = {.outer = sink};
@@ -107,11 +190,46 @@ int aka_engine_index_with_sink(const aka_engine_index_options_t *options,
                              .done = bridge_done};
     cbm_pipeline_set_fact_sink(pipeline, &inner);
     cbm_pipeline_set_skip_dump(pipeline, options->direct_facts_only);
+    cbm_pipeline_callbacks_t pipeline_callbacks = {
+        .userdata = (void *)callbacks,
+        .progress = callbacks && callbacks->progress ? bridge_progress : NULL,
+        .should_cancel = callbacks && callbacks->should_cancel ? bridge_should_cancel : NULL,
+        .deadline_ms_monotonic = options->deadline_ms_monotonic,
+    };
+    if (options->max_indexing_time_ms > 0) {
+        uint64_t relative_deadline = aka_engine_monotonic_ms() + options->max_indexing_time_ms;
+        if (pipeline_callbacks.deadline_ms_monotonic == 0 ||
+            relative_deadline < pipeline_callbacks.deadline_ms_monotonic) {
+            pipeline_callbacks.deadline_ms_monotonic = relative_deadline;
+        }
+    }
+    if (callbacks || pipeline_callbacks.deadline_ms_monotonic > 0) {
+        cbm_pipeline_set_callbacks(pipeline, &pipeline_callbacks);
+    }
 
-    cbm_pipeline_lock();
+    int lock_rc = pipeline_lock_cooperative(&pipeline_callbacks);
+    if (lock_rc != 0) {
+        cbm_pipeline_free(pipeline);
+        cbm_mem_collect();
+        return AKA_ENGINE_CANCELLED;
+    }
+    cbm_log_sink_fn prev_log_sink = NULL;
+    cbm_log_sink_ex_fn prev_log_sink_ex = NULL;
+    void *prev_log_userdata = NULL;
+    cbm_log_get_sink_state(&prev_log_sink, &prev_log_sink_ex, &prev_log_userdata);
+    if (callbacks && callbacks->log) {
+        cbm_log_set_sink_ex(bridge_log, (void *)callbacks);
+    }
     int rc = cbm_pipeline_run(pipeline);
+    restore_log_sink(prev_log_sink, prev_log_sink_ex, prev_log_userdata);
     cbm_pipeline_unlock();
     cbm_pipeline_free(pipeline);
     cbm_mem_collect();
-    return rc;
+    if (rc == CBM_CANCELLED) {
+        return AKA_ENGINE_CANCELLED;
+    }
+    if (rc != 0) {
+        return AKA_ENGINE_ERROR;
+    }
+    return AKA_ENGINE_OK;
 }

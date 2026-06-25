@@ -456,6 +456,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     int total_calls = 0;
     int total_imports = 0;
     int errors = 0;
+    int rc = 0;
 
     /* Sequential pass must extract all defs (which create Module/Function/...
      * nodes) BEFORE resolving imports — otherwise a workspace import in the
@@ -473,8 +474,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
      * Functions, ...) so any file's IMPORTS can resolve against the
      * complete in-memory graph in Phase 2. */
     for (int i = 0; i < file_count; i++) {
-        if (cbm_pipeline_check_cancel(ctx)) {
-            return CBM_NOT_FOUND;
+        int cancel_rc = cbm_pipeline_check_cancel(ctx);
+        if (cancel_rc != 0) {
+            rc = cancel_rc;
+            goto cleanup;
         }
 
         const char *path = files[i].path;
@@ -523,6 +526,15 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             create_env_configures_for_file(ctx, result, rel);
             cbm_free_result(result);
         }
+
+        if (((i + SKIP_ONE) % CBM_SZ_64) == 0 || i + SKIP_ONE == file_count) {
+            int pr = cbm_pipeline_emit_progress_ctx(ctx, "definitions", rel, i + SKIP_ONE,
+                                                    file_count);
+            if (pr != 0) {
+                rc = pr;
+                goto cleanup;
+            }
+        }
     }
 
     /* Phase 2: now that all extraction results are cached and Module
@@ -543,8 +555,11 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_pipeline_namespace_map_build(ctx->project_name, local_cache, rels, file_count);
         free(rels);
         for (int i = 0; i < file_count; i++) {
-            if (cbm_pipeline_check_cancel(ctx)) {
-                break;
+            int cancel_rc = cbm_pipeline_check_cancel(ctx);
+            if (cancel_rc != 0) {
+                cbm_pipeline_namespace_map_free(namespace_map);
+                rc = cancel_rc;
+                goto cleanup;
             }
             CBMFileResult *result = local_cache[i];
             if (!result) {
@@ -556,14 +571,19 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
         cbm_pipeline_namespace_map_free(namespace_map);
-        if (owns_local_cache) {
-            for (int i = 0; i < file_count; i++) {
-                if (local_cache[i]) {
-                    cbm_free_result(local_cache[i]);
-                }
+    }
+
+cleanup:
+    if (owns_local_cache && local_cache) {
+        for (int i = 0; i < file_count; i++) {
+            if (local_cache[i]) {
+                cbm_free_result(local_cache[i]);
             }
-            free(local_cache);
         }
+        free(local_cache);
+    }
+    if (rc != 0) {
+        return rc;
     }
 
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
