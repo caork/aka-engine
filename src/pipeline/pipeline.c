@@ -90,6 +90,7 @@ struct cbm_pipeline {
     const cbm_fact_sink_t *fact_sink;
     const cbm_pipeline_callbacks_t *callbacks;
     bool skip_dump;
+    bool baseline_facts_only;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -423,6 +424,12 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
 void cbm_pipeline_set_skip_dump(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->skip_dump = enabled;
+    }
+}
+
+void cbm_pipeline_set_baseline_facts_only(cbm_pipeline_t *p, bool enabled) {
+    if (p) {
+        p->baseline_facts_only = enabled;
     }
 }
 
@@ -927,7 +934,7 @@ static int seq_pass_lsp_cross_dispatch(cbm_pipeline_ctx_t *ctx, const cbm_file_i
     return cbm_pipeline_pass_lsp_cross(ctx, files, file_count, ctx->result_cache);
 }
 
-/* Run the sequential pipeline path: definitions, k8s, lsp_cross, calls, usages, semantic. */
+/* Run the sequential pipeline path. Baseline direct facts stop after definitions/imports. */
 static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                    const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
@@ -958,7 +965,8 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         {cbm_pipeline_pass_semantic, "semantic", false},
     };
     int rc = 0;
-    for (int si = 0; si < PL_SEQ_PASSES && rc == 0; si++) {
+    int seq_pass_count = p->baseline_facts_only ? 1 : PL_SEQ_PASSES;
+    for (int si = 0; si < seq_pass_count && rc == 0; si++) {
         rc = emit_progress(p, seq_passes[si].name, "", 0, file_count);
         if (rc != 0) {
             break;
@@ -978,11 +986,16 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
             rc = cancel_rc;
         }
     }
+    if (p->baseline_facts_only) {
+        cbm_log_info("pass.skip", "pass", "lsp_cross,calls,usages,semantic,k8s,infra",
+                     "reason", "baseline_facts_only");
+    }
+
     /* Consume infra bindings (YAML/HCL topic/queue/scheduler → endpoint) so
      * INFRA_MAPS edges also form on the sequential path, not just the parallel
      * one. process_one_infra_binding self-creates the topic Route node when no
      * code-side dispatch created it (e.g. a standalone scheduler manifest). */
-    if (seq_cache && rc == 0) {
+    if (seq_cache && rc == 0 && !p->baseline_facts_only) {
         cbm_pipeline_extract_infra_routes(p->gbuf, files, seq_cache, file_count);
         cbm_pipeline_process_infra_bindings(p->gbuf, files, seq_cache, file_count);
     }
@@ -1060,6 +1073,13 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free_result_cache(cache, file_count);
         return rc;
     }
+    if (p->baseline_facts_only) {
+        cbm_log_info("pass.skip", "pass", "lsp_cross_prepare,parallel_resolve,infra,k8s",
+                     "reason", "baseline_facts_only");
+        free_result_cache(cache, file_count);
+        return check_cancel(p);
+    }
+
     /* Cross-file LSP precondition: build a project-wide CBMLSPDef[]
      * once. The fused resolve_worker invokes cbm_pxc_run_one(_ts) per
      * file using these defs + the file's IMPORTS map, so cross-file
@@ -1383,6 +1403,29 @@ static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 /* Run tests, git history, predump passes, and dump+persist. */
 static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                const cbm_file_info_t *files, int file_count) {
+    if (p->baseline_facts_only) {
+        cbm_log_info("pass.skip", "pass", "tests,githistory,predump",
+                     "reason", "baseline_facts_only");
+        int rc = 0;
+        if (p->fact_sink) {
+            rc = emit_facts_to_sink(p, p->fact_sink);
+        }
+        if (rc == 0 && !p->skip_dump) {
+            struct timespec t;
+            rc = emit_progress(p, "dump", "", 0, file_count);
+            if (rc != 0) {
+                return rc;
+            }
+            CBM_PROF_START(t_dump);
+            rc = dump_and_persist_hashes(p, files, file_count, &t);
+            CBM_PROF_END("pipeline", "4_dump_and_persist", t_dump);
+            if (rc == 0) {
+                rc = emit_progress(p, "dump", "", file_count, file_count);
+            }
+        }
+        return rc;
+    }
+
     int rc = run_tests_and_history(p, ctx, files, file_count);
     if (rc != 0) {
         return rc;
@@ -1541,6 +1584,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .cancelled = &p->cancelled,
         .callbacks = p->callbacks,
         .mode = (int)p->mode,
+        .baseline_facts_only = p->baseline_facts_only,
         .path_aliases = path_aliases,
     };
 

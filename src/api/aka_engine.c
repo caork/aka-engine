@@ -190,6 +190,7 @@ int aka_engine_index_with_sink(const aka_engine_index_options_t *options,
                              .done = bridge_done};
     cbm_pipeline_set_fact_sink(pipeline, &inner);
     cbm_pipeline_set_skip_dump(pipeline, options->direct_facts_only);
+    cbm_pipeline_set_baseline_facts_only(pipeline, options->baseline_facts_only);
     cbm_pipeline_callbacks_t pipeline_callbacks = {
         .userdata = (void *)callbacks,
         .progress = callbacks && callbacks->progress ? bridge_progress : NULL,

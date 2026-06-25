@@ -59,6 +59,7 @@ typedef struct {
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
     const cbm_pipeline_callbacks_t *callbacks; /* borrowed from pipeline */
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
+    bool baseline_facts_only; /* skip legacy custom enrichment and emit parser baseline only */
 
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,

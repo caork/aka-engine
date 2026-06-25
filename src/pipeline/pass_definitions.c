@@ -214,7 +214,35 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
 }
 
 /* Build properties JSON for a definition node. */
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
+                            bool baseline_facts_only) {
+    if (baseline_facts_only) {
+        int n = snprintf(buf, bufsize,
+                         "{\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
+                         "\"is_entry_point\":%s",
+                         def->lines, def->is_exported ? "true" : "false",
+                         def->is_test ? "true" : "false",
+                         def->is_entry_point ? "true" : "false");
+        if (n <= 0 || (size_t)n >= bufsize) {
+            buf[0] = '\0';
+            return;
+        }
+        size_t pos = (size_t)n;
+        append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
+        append_json_string(buf, bufsize, &pos, "signature", def->signature);
+        append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
+        append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
+        append_json_str_array(buf, bufsize, &pos, "decorators", def->decorators);
+        append_json_str_array(buf, bufsize, &pos, "base_classes", def->base_classes);
+        append_json_str_array(buf, bufsize, &pos, "param_names", def->param_names);
+        append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
+        if (pos < bufsize - SKIP_ONE) {
+            buf[pos] = '}';
+            buf[pos + SKIP_ONE] = '\0';
+        }
+        return;
+    }
+
     /* The complexity/loop/recursion metrics are only meaningful for executable
      * units (Function/Method). Emitting them on the millions of Macro/Field/
      * Variable/Class/Enum nodes — where they are always zero — bloats every
@@ -291,7 +319,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
         return;
     }
     char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+    build_def_props(props, sizeof(props), def, ctx->baseline_facts_only);
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
@@ -522,8 +550,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * own defs are now persisted before the lookup. No namespace
              * map is available without the cache (single-file scope). */
             total_imports += create_import_edges_for_file(ctx, result, rel, NULL);
-            create_channel_edges_for_file(ctx, result, rel);
-            create_env_configures_for_file(ctx, result, rel);
+            if (!ctx->baseline_facts_only) {
+                create_channel_edges_for_file(ctx, result, rel);
+                create_env_configures_for_file(ctx, result, rel);
+            }
             cbm_free_result(result);
         }
 
@@ -567,8 +597,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
             total_imports +=
                 create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
-            create_channel_edges_for_file(ctx, result, files[i].rel_path);
-            create_env_configures_for_file(ctx, result, files[i].rel_path);
+            if (!ctx->baseline_facts_only) {
+                create_channel_edges_for_file(ctx, result, files[i].rel_path);
+                create_env_configures_for_file(ctx, result, files[i].rel_path);
+            }
         }
         cbm_pipeline_namespace_map_free(namespace_map);
     }

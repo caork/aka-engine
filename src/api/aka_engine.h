@@ -47,6 +47,7 @@ typedef struct {
     bool direct_facts_only;
     uint64_t deadline_ms_monotonic; /* 0 disables; compared with engine monotonic clock */
     uint64_t max_indexing_time_ms;  /* 0 disables; relative budget from call start */
+    bool baseline_facts_only;       /* skip legacy custom enrichment passes */
 } aka_engine_index_options_t;
 
 typedef struct {
@@ -81,7 +82,10 @@ typedef struct {
  *
  * The fact sink and optional callbacks are borrowed for the duration of the
  * call. If direct_facts_only is true, the engine emits facts but skips its
- * SQLite dump/persistence; Rust owns graph/search persistence. */
+ * SQLite dump/persistence; Rust owns graph/search persistence. If
+ * baseline_facts_only is true, direct facts stop after structure,
+ * definitions, imports, and fact emission; OSS analyzer providers own later
+ * enrichment facts. */
 AKA_ENGINE_API int aka_engine_index_with_sink(const aka_engine_index_options_t *options,
                                               const aka_engine_fact_sink_t *sink);
 

@@ -256,7 +256,35 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
+                            bool baseline_facts_only) {
+    if (baseline_facts_only) {
+        int n = snprintf(buf, bufsize,
+                         "{\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
+                         "\"is_entry_point\":%s",
+                         def->lines, def->is_exported ? "true" : "false",
+                         def->is_test ? "true" : "false",
+                         def->is_entry_point ? "true" : "false");
+        if (n <= 0 || (size_t)n >= bufsize) {
+            buf[0] = '\0';
+            return;
+        }
+        size_t pos = (size_t)n;
+        append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
+        append_json_string(buf, bufsize, &pos, "signature", def->signature);
+        append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
+        append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
+        append_json_str_array(buf, bufsize, &pos, "decorators", def->decorators);
+        append_json_str_array(buf, bufsize, &pos, "base_classes", def->base_classes);
+        append_json_str_array(buf, bufsize, &pos, "param_names", def->param_names);
+        append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
+        if (pos < bufsize - SKIP_ONE) {
+            buf[pos] = '}';
+            buf[pos + SKIP_ONE] = '\0';
+        }
+        return;
+    }
+
     /* Complexity/loop/recursion metrics are meaningful only for Function/Method.
      * Gate the block so the millions of Macro/Field/Variable/Class/Enum nodes
      * keep a lean properties blob (lossless — those fields are always zero for
@@ -483,6 +511,7 @@ typedef struct {
     _Atomic int *cancelled;
     _Atomic int next_file_idx;
     const cbm_pipeline_callbacks_t *callbacks;
+    bool baseline_facts_only;
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
     _Atomic int64_t retained_bytes; /* total source bytes copied into result arenas */
@@ -510,15 +539,15 @@ static int extract_should_cancel(extract_ctx_t *ec) {
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
 static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
-                                 CBMDefinition *def) {
+                                 CBMDefinition *def, bool baseline_facts_only) {
     char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+    build_def_props(props, sizeof(props), def, baseline_facts_only);
     int64_t func_id =
         cbm_gbuf_upsert_node(ws->local_gbuf, def->label ? def->label : "Function", def->name,
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
                              (int)def->start_line, (int)def->end_line, props);
     ws->nodes_created++;
-    if (def->route_path && def->route_path[0] != '\0') {
+    if (!baseline_facts_only && def->route_path && def->route_path[0] != '\0') {
         const char *rm = def->route_method ? def->route_method : "ANY";
         char route_qn[CBM_ROUTE_QN_SIZE];
         snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", rm, def->route_path);
@@ -624,7 +653,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
             if (def->qualified_name && def->name) {
-                insert_def_into_gbuf(ws, fi, def);
+                insert_def_into_gbuf(ws, fi, def, ec->baseline_facts_only);
             }
         }
 
@@ -646,7 +675,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * globally (PP_RETAIN_TOTAL_BUDGET_BYTES) to bound peak RSS.
          * Skipping retention just means cross-file LSP no-ops for this
          * file — defs/calls already extracted are unaffected. */
-        if (source_len > 0 && (int64_t)source_len <= PP_RETAIN_PER_FILE_MAX_BYTES) {
+        if (!ec->baseline_facts_only && source_len > 0 &&
+            (int64_t)source_len <= PP_RETAIN_PER_FILE_MAX_BYTES) {
             int64_t prior = atomic_fetch_add_explicit(&ec->retained_bytes, (int64_t)source_len,
                                                       memory_order_relaxed);
             if (prior + (int64_t)source_len <= PP_RETAIN_TOTAL_BUDGET_BYTES) {
@@ -790,6 +820,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
         .callbacks = ctx->callbacks,
+        .baseline_facts_only = ctx->baseline_facts_only,
         .pkg_entries = pkg_entries,
     };
     atomic_init(&ec.next_worker_id, 0);
@@ -1006,7 +1037,9 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
-        create_channel_edges(ctx, result, rel);
+        if (!ctx->baseline_facts_only) {
+            create_channel_edges(ctx, result, rel);
+        }
     }
 
     cbm_pipeline_namespace_map_free(namespace_map);

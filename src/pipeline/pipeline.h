@@ -5,10 +5,7 @@
  *   1. Structure: Project/Folder/Package/File nodes
  *   2. Definitions: Extract + write nodes + build registry
  *   3. Imports: Resolve import edges
- *   4. Calls: Call resolution (registry + LSP)
- *   5. Usages: Usage/type_ref edges
- *   6. Semantic: Inherits/decorates/implements
- *   7. Post: Tests, communities, HTTP links, config, git history
+ *   4. Optional legacy enrichment: calls/usages/semantic/post passes
  *
  * Depends on: foundation, extraction, lsp, store, graph_buffer, discover
  */
@@ -76,6 +73,11 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 /* Skip SQLite dump/persistence after fact emission. Intended for embedded
  * in-process facts where Rust owns graph/search persistence. */
 void cbm_pipeline_set_skip_dump(cbm_pipeline_t *p, bool enabled);
+
+/* Keep only parser baseline facts: structure, definitions, imports, and fact
+ * emission. The host can merge OSS analyzer facts later without blocking the
+ * baseline graph/search. */
+void cbm_pipeline_set_baseline_facts_only(cbm_pipeline_t *p, bool enabled);
 
 /* Emit dump-ready facts to a callback sink after predump passes and before
  * SQLite persistence. The sink is borrowed; the caller must keep it alive until
