@@ -48,6 +48,7 @@ typedef struct {
     uint64_t deadline_ms_monotonic; /* 0 disables; compared with engine monotonic clock */
     uint64_t max_indexing_time_ms;  /* 0 disables; relative budget from call start */
     bool baseline_facts_only;       /* skip legacy custom enrichment passes */
+    const char *db_path;            /* optional private SQLite facts DB path */
 } aka_engine_index_options_t;
 
 typedef struct {

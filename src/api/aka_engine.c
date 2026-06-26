@@ -9,6 +9,7 @@
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/profile.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "pipeline/pipeline.h"
 
@@ -126,6 +127,23 @@ static int set_cache_dir(const char *cache_dir) {
     return cbm_setenv("AKA_ENGINE_CACHE_DIR", cache_dir, 1);
 }
 
+static char *effective_db_path(const aka_engine_index_options_t *options) {
+    if (options->db_path && options->db_path[0]) {
+        return strdup(options->db_path);
+    }
+    if (!options->cache_dir || !options->cache_dir[0]) {
+        return NULL;
+    }
+    cbm_mkdir_p(options->cache_dir, 0755);
+    size_t len = strlen(options->cache_dir) + strlen("/facts.db") + 1;
+    char *path = malloc(len);
+    if (!path) {
+        return NULL;
+    }
+    snprintf(path, len, "%s/facts.db", options->cache_dir);
+    return path;
+}
+
 static void restore_log_sink(cbm_log_sink_fn legacy, cbm_log_sink_ex_fn extended,
                              void *userdata) {
     if (extended) {
@@ -176,8 +194,10 @@ int aka_engine_index_with_sink(const aka_engine_index_options_t *options,
     cbm_mem_init(0.5);
 
     const aka_engine_callbacks_t *callbacks = sink->callbacks;
+    char *db_path = effective_db_path(options);
     cbm_pipeline_t *pipeline =
-        cbm_pipeline_new(options->repo_path, NULL, to_cbm_mode(options->mode));
+        cbm_pipeline_new(options->repo_path, db_path, to_cbm_mode(options->mode));
+    free(db_path);
     if (!pipeline) {
         return AKA_ENGINE_ERROR;
     }

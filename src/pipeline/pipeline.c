@@ -392,6 +392,28 @@ static int emit_facts_to_sink(cbm_pipeline_t *p, const cbm_fact_sink_t *sink) {
     return 0;
 }
 
+static int emit_facts_from_db(cbm_pipeline_t *p, const char *db_path) {
+    if (!p || !p->fact_sink) {
+        return 0;
+    }
+    cbm_gbuf_t *loaded = cbm_gbuf_new(p->project_name, p->repo_path);
+    if (!loaded) {
+        return CBM_NOT_FOUND;
+    }
+    int rc = cbm_gbuf_load_from_db(loaded, db_path, p->project_name);
+    if (rc != 0) {
+        cbm_log_error("pipeline.err", "phase", "facts_load_incremental_db");
+        cbm_gbuf_free(loaded);
+        return rc;
+    }
+    cbm_gbuf_t *previous = p->gbuf;
+    p->gbuf = loaded;
+    rc = emit_facts_to_sink(p, p->fact_sink);
+    p->gbuf = previous;
+    cbm_gbuf_free(loaded);
+    return rc;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
@@ -1222,6 +1244,9 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
             cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                          itoa_buf(hash_count));
             int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
+            if (rc == 0) {
+                rc = emit_facts_from_db(p, db_path);
+            }
             free(db_path);
             return rc;
         }
@@ -1254,6 +1279,35 @@ static int64_t stat_mtime_ns(const struct stat *fst) {
 #else
     return ((int64_t)fst->st_mtim.tv_sec * PL_NSEC_PER_SEC) + (int64_t)fst->st_mtim.tv_nsec;
 #endif
+}
+
+static int file_content_fingerprint(const char *path, char out[CBM_SZ_64]) {
+    out[0] = '\0';
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return CBM_NOT_FOUND;
+    }
+    uint64_t h1 = 1469598103934665603ULL;
+    uint64_t h2 = 1099511628211ULL;
+    unsigned char buf[CBM_SZ_8K];
+    size_t nread = 0;
+    while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < nread; i++) {
+            h1 ^= (uint64_t)buf[i];
+            h1 *= 1099511628211ULL;
+            h2 ^= (uint64_t)buf[i] + 0x9e3779b9ULL;
+            h2 *= 14029467366897019727ULL;
+        }
+    }
+    int failed = ferror(f);
+    fclose(f);
+    if (failed) {
+        out[0] = '\0';
+        return CBM_NOT_FOUND;
+    }
+    snprintf(out, CBM_SZ_64, "fnv128:%016llx%016llx", (unsigned long long)h1,
+             (unsigned long long)h2);
+    return 0;
 }
 
 /* Dump graph to SQLite and persist file hashes for incremental indexing. */
@@ -1289,8 +1343,12 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         for (int i = 0; i < file_count; i++) {
             struct stat fst;
             if (stat(files[i].path, &fst) == 0) {
-                cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path, "",
-                                           stat_mtime_ns(&fst), fst.st_size);
+                char fingerprint[CBM_SZ_64];
+                if (file_content_fingerprint(files[i].path, fingerprint) != 0) {
+                    fingerprint[0] = '\0';
+                }
+                cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path,
+                                           fingerprint, stat_mtime_ns(&fst), fst.st_size);
             }
         }
 

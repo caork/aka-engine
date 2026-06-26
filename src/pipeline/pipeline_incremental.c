@@ -70,9 +70,40 @@ static int64_t stat_mtime_ns(const struct stat *st) {
 #endif
 }
 
+static int file_content_fingerprint(const char *path, char out[CBM_SZ_64]) {
+    out[0] = '\0';
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return CBM_NOT_FOUND;
+    }
+    uint64_t h1 = 1469598103934665603ULL;
+    uint64_t h2 = 1099511628211ULL;
+    unsigned char buf[CBM_SZ_8K];
+    size_t nread = 0;
+    while ((nread = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < nread; i++) {
+            h1 ^= (uint64_t)buf[i];
+            h1 *= 1099511628211ULL;
+            h2 ^= (uint64_t)buf[i] + 0x9e3779b9ULL;
+            h2 *= 14029467366897019727ULL;
+        }
+    }
+    int failed = ferror(f);
+    fclose(f);
+    if (failed) {
+        out[0] = '\0';
+        return CBM_NOT_FOUND;
+    }
+    snprintf(out, CBM_SZ_64, "fnv128:%016llx%016llx", (unsigned long long)h1,
+             (unsigned long long)h2);
+    return 0;
+}
+
 /* ── File classification ─────────────────────────────────────────── */
 
-/* Classify discovered files against stored hashes using mtime+size.
+/* Classify discovered files against stored hashes using content fingerprint,
+ * mtime, and size. Older DB rows have an empty sha256 column, so they are
+ * conservatively reparsed once and then upgraded.
  * Returns a boolean array: changed[i] = true if files[i] needs re-parsing.
  * Caller must free the returned array. */
 static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
@@ -108,7 +139,10 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             continue;
         }
 
-        if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+        char fingerprint[CBM_SZ_64];
+        int hash_rc = file_content_fingerprint(files[i].path, fingerprint);
+        if (hash_rc != 0 || !h->sha256 || strcmp(h->sha256, fingerprint) != 0 ||
+            stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
             changed[i] = true;
             n_changed++;
         } else {
@@ -323,7 +357,11 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
         if (stat(files[i].path, &st) != 0) {
             continue;
         }
-        int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
+        char fingerprint[CBM_SZ_64];
+        if (file_content_fingerprint(files[i].path, fingerprint) != 0) {
+            fingerprint[0] = '\0';
+        }
+        int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, fingerprint,
                                             stat_mtime_ns(&st), st.st_size);
         if (rc != CBM_STORE_OK) {
             cbm_log_warn("incremental.persist_hash_failed", "scope", "current", "rel_path",
